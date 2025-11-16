@@ -1,0 +1,21 @@
+{
+  "name": "didactic-doodle",
+  "version": "1.0.0",
+  "description": "Semantic Metrics Engine — Proof-of-Concept Design",
+  "main": "index.js",
+  "scripts": {
+    "test": "mocha -r ts-node/register 'test/**/*.test.ts'"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@types/chai": "^5.2.3",
+    "@types/mocha": "^10.0.10",
+    "chai": "^6.2.1",
+    "mocha": "^11.7.5",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}
