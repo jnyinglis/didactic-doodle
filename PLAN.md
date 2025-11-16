@@ -10,10 +10,7 @@ This document outlines the concrete steps required to refactor the filter range 
 2. **Update construction and parsing logic**
    - Refactor helper functions that build or consume `FilterRange` instances to switch on the discriminant instead of probing optional properties.
    - Ensure serialization/deserialization routines emit and expect the `kind` field, preventing ambiguous payloads.
-3. **Provide a compatibility adapter**
-   - Add a converter that accepts the legacy shape (multiple optional keys) and produces a validated union variant.
-   - Detect conflicting keys (e.g., both `from` and `gt`) and throw or log helpful errors so callers can remediate input mistakes quickly.
-4. **Expand automated tests**
+3. **Expand automated tests**
    - Cover each valid union variant through unit tests.
    - Add regression tests for invalid combinations to guarantee the runtime rejects ambiguous filters going forward.
 
