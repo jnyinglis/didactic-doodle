@@ -11,7 +11,7 @@ from `src/semanticEngine.ts` into a React + Vite single-page app. The UI ships w
   ship from the README examples. The editor persists to `localStorage` so you can refresh without
   losing custom metrics.
 - A visual runner that wraps the existing `runQuery` helper. Pick row dimensions (respecting the
-  grain of your fact table), metrics, filters, and run the query against the in-memory dataset.
+  grain of your table), metrics, filters, and run the query against the in-memory dataset.
 - A result panel with an interactive table, a selectable bar/line chart fed by the same dataset, and
   expandable blocks that show the request payload plus the raw response rows. This makes it easy to
   reason about how metric grain, filters, and formatting behave.
@@ -43,7 +43,7 @@ This document describes the design and implementation of a semantic metrics engi
 
 The goal is to provide a flexible, in-memory engine that models:
 	•	Reusable dimensions
-	•	Configurable fact tables and fact columns
+	•	Configurable tables and columns
 	•	Semantically defined metrics (base, derived, and expression-based)
 	•	Reusable, composable time-intelligence transformations
 	•	Dynamic level-aware evaluation (metric-level grain)
@@ -55,100 +55,88 @@ This POC does not rely on a database; all data is stored in JSON objects and eva
 
 1. Core Concepts
 
-1.1 Dimensions
+1.1 Tables & Columns
 
-Dimensions represent business entities used for slicing and dicing metric values.
+Tables represent both lookup entities (like regions/products) and transactional sources (like sales/budget).
+Each table definition captures:
+        •       Native grain (dimensions present in each row)
+        •       Column metadata (role, default aggregation, formatting, label relationships)
+        •       Optional relationships to other tables for enrichment
 
-const dimensionConfig = {
-  regionId: {
-    table: 'regions',
-    key: 'regionId',
-    labelProp: 'name',
-    labelAlias: 'regionName',
-  },
-  productId: {
-    table: 'products',
-    key: 'productId',
-    labelProp: 'name',
-    labelAlias: 'productName',
-  },
-};
-
-Each dimension:
-	•	Has a key field (e.g., regionId)
-	•	Has a lookup table in db.dimensions
-	•	Has a label and an alias for display in results
-
-This enables automatic enrichment of result rows with readable labels.
-
-⸻
-
-1.2 Fact Tables
-
-Fact tables store atomic transactional or aggregated data.
-Each fact table defines:
-	•	Native grain (dimensions present in the rows)
-	•	Fact columns (numeric columns that metrics can aggregate)
-
-const factTables = {
+const tableDefinitions = {
   sales: {
+    name: 'sales',
     grain: ['year', 'month', 'regionId', 'productId'],
-    measures: {
-      amount: {
-        column: 'amount',
-        defaultAgg: 'sum',
-        format: 'currency',
-      },
-      quantity: {
-        column: 'quantity',
-        defaultAgg: 'sum',
-        format: 'integer',
-      },
+    columns: {
+      year: { role: 'attribute', dataType: 'number' },
+      month: { role: 'attribute', dataType: 'number' },
+      regionId: { role: 'attribute', dataType: 'string' },
+      productId: { role: 'attribute', dataType: 'number' },
+      amount: { role: 'measure', defaultAgg: 'sum', format: 'currency' },
+      quantity: { role: 'measure', defaultAgg: 'sum', format: 'integer' },
+    },
+    relationships: {
+      region: { references: 'regions', column: 'regionId' },
+      product: { references: 'products', column: 'productId' },
     },
   },
-
-  budget: {
-    grain: ['year', 'regionId'],
-    measures: {
-      budgetAmount: {
-        column: 'budgetAmount',
-        defaultAgg: 'sum',
-        format: 'currency',
-      },
+  regions: {
+    name: 'regions',
+    grain: ['regionId'],
+    columns: {
+      regionId: { role: 'attribute', dataType: 'string' },
+      regionName: { role: 'attribute', labelFor: 'regionId' },
+    },
+  },
+  products: {
+    name: 'products',
+    grain: ['productId'],
+    columns: {
+      productId: { role: 'attribute', dataType: 'number' },
+      productName: { role: 'attribute', labelFor: 'productId' },
     },
   },
 };
 
-This structure separates:
-	•	The table (grain, relationships)
-	•	The fact columns (numeric measures)
-	•	Default aggregations and display formats
+const db = {
+  tables: {
+    sales: [...],
+    budget: [...],
+    regions: [...],
+    products: [...],
+  },
+};
 
-⸻
+`labelFor` columns provide human-friendly names for attribute keys (e.g., `regionName` for `regionId`).
+Because all data lives in `db.tables`, enrichment no longer requires a separate dimension config —
+the semantic layer can inspect table metadata to discover labels automatically.
+
+
+
 
 2. Metric Types
 
-Metrics are semantic objects defined on top of fact columns or other metrics.
+Metrics are semantic objects defined on top of table columns or other metrics.
 
 The library supports four metric types.
 
 ⸻
 
-2.1 factMeasure — Metric on a fact column
+2.1 factMeasure — Metric on a table column
 
-Represents a simple aggregation over a fact column.
+Represents a simple aggregation over a table column.
 
 totalSalesAmount: {
   kind: 'factMeasure',
-  factTable: 'sales',
-  factColumn: 'amount',
+  table: 'sales',
+  column: 'amount',
   agg: 'sum',
   grain: ['year','month','regionId','productId'],
   format: 'currency',
 }
 
 Properties:
-	•	Reads from a single fact column
+	•	Reads from a single table column
 	•	Uses metric-level grain (controls which filters are respected/ignored)
 	•	Performs standard aggregations (sum, avg, count, etc.)
 
@@ -156,13 +144,13 @@ This is equivalent to MicroStrategy’s simple metrics.
 
 ⸻
 
-2.2 expression — Custom expression on raw fact rows
+2.2 expression — Custom expression on raw table rows
 
 Used when aggregation logic cannot be expressed as a single column aggregation.
 
 pricePerUnit: {
   kind: 'expression',
-  factTable: 'sales',
+  table: 'sales',
   grain: ['year','month','regionId','productId'],
   expression: q => {
     const amount = q.sum(r => r.amount);
@@ -273,7 +261,7 @@ This models MicroStrategy level metrics:
 
 5. Filter Context Evaluation
 
-The filter context is applied to fact rows by checking each filter only against dimensions in the metric’s grain.
+The filter context is applied to table rows by checking each filter only against dimensions in the metric’s grain.
 
 applyContextToFact(rows, context, grain)
 
@@ -311,11 +299,11 @@ runQuery({
   rows: [...dimension keys],      // e.g. ['regionId', 'productId']
   filters: {...},                 // global filter context
   metrics: [...metric names],     // metrics to evaluate
-  fact: 'sales',                  // fact used to find row combinations
+  table: 'sales',                 // table used to find row combinations
 });
 
 Steps performed internally:
-	1.	Filter the fact table using global context.
+	1.	Filter the requested table using global context.
 	2.	Determine distinct combinations of requested row dimensions.
 	3.	For each combination:
 	•	Merge into a row-specific filter context
@@ -347,7 +335,7 @@ Example Output
 
 ✔ Declarative semantic layer
 
-Dimensions, fact tables, fact columns, and metrics are all explicitly modeled.
+Dimensions, tables, columns, and metrics are all explicitly modeled.
 
 ✔ Metric-level dimensionality (grain)
 
@@ -437,9 +425,9 @@ demoMetrics.totalSalesAmount = {
   kind: "factMeasure",
   name: "totalSalesAmount",
   description: "Sum of sales amount over the current context.",
-  factTable: "sales",
-  factColumn: "amount",
-  format: "currency",    // uses fact column’s defaultAgg = sum
+  table: "sales",
+  column: "amount",
+  format: "currency",    // uses table column’s defaultAgg = sum
 };
 
 2.2 Defining an expression metric
@@ -448,7 +436,7 @@ demoMetrics.pricePerUnit = {
   kind: "expression",
   name: "pricePerUnit",
   description: "Sales amount / quantity over the current context.",
-  factTable: "sales",
+  table: "sales",
   format: "currency",
   expression: (q) => {
     const amount = q.sum((r: Row) => Number(r.amount ?? 0));
@@ -489,15 +477,14 @@ ytd is defined in demoTransforms and can be reused for any metric.
 
 const rows = runQuery(
   demoDb,
-  demoFactTables,
+  demoTableDefinitions,
   demoMetrics,
   demoTransforms,
-  demoDimensionConfig,
   {
     rows: ["regionId", "productId"],
     filters: { year: 2025, month: 2 },
     metrics: ["totalSalesAmount", "salesAmountYTD", "totalBudget"],
-    factForRows: "sales",
+    tableForRows: "sales",
   }
 );
 

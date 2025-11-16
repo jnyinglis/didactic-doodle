@@ -1,79 +1,21 @@
 // semanticEngine.ts
 // POC semantic metrics engine with factMeasure, expression, derived, contextTransform
 //
-// The original version of this file used the `linq` package for fluent,
-// chainable array helpers. Shipping that dependency caused the GH Pages build
-// to fail because the bundler could not resolve modules outside the Vite app
-// root. To keep the ergonomics without the dependency, we ship a tiny
-// RowSequence helper below that implements just the operators we need.
+// This file now relies on the bundled linq.js implementation for fluent row
+// operations so callers can chain `Enumerable` helpers end-to-end.
 
-export class RowSequence {
-  private readonly rows: Row[];
-
-  private constructor(rows: Row[]) {
-    this.rows = rows;
-  }
-
-  static from(rows: Row[]): RowSequence {
-    return new RowSequence([...rows]);
-  }
-
-  where(predicate: (row: Row) => boolean): RowSequence {
-    return new RowSequence(this.rows.filter(predicate));
-  }
-
-  sum(selector: (row: Row) => number): number {
-    return this.rows.reduce((total, row) => {
-      const value = Number(selector(row));
-      if (Number.isNaN(value)) return total;
-      return total + value;
-    }, 0);
-  }
-
-  average(selector: (row: Row) => number): number | null {
-    if (this.rows.length === 0) return null;
-    return this.sum(selector) / this.rows.length;
-  }
-
-  count(): number {
-    return this.rows.length;
-  }
-
-  groupBy<TKey extends string, TValue>(
-    keySelector: (row: Row) => TKey,
-    valueSelector: (row: Row) => TValue
-  ) {
-    const groups = new Map<TKey, TValue[]>();
-    this.rows.forEach((row) => {
-      const key = keySelector(row);
-      const existing = groups.get(key);
-      const value = valueSelector(row);
-      if (existing) {
-        existing.push(value);
-      } else {
-        groups.set(key, [value]);
-      }
-    });
-
-    const groupArray = Array.from(groups.entries()).map(([key, values]) => ({
-      key: () => key,
-      toArray: () => [...values],
-    }));
-
-    return {
-      toArray: () => groupArray,
-    };
-  }
-
-  toArray(): Row[] {
-    return [...this.rows];
-  }
-}
+import Enumerable from "./linq";
 
 /**
- * Basic row type for facts/dimensions.
+ * Basic row type for tables.
  */
 export type Row = Record<string, any>;
+
+export type RowSequence = Enumerable.IEnumerable<Row>;
+
+export function rowsToEnumerable(rows: Row[] = []): RowSequence {
+  return Enumerable.from(rows ?? []);
+}
 
 /**
  * Filter context types:
@@ -93,49 +35,29 @@ export type FilterValue = FilterPrimitive | FilterRange;
 export type FilterContext = Record<string, FilterValue>;
 
 /**
- * In-memory DB: dimensions + facts.
- * This is a POC dataset; in a real app you’d wire your own.
+ * In-memory DB storing raw table rows.
  */
 export interface InMemoryDb {
-  dimensions: Record<string, Row[]>;
-  facts: Record<string, Row[]>;
+  tables: Record<string, Row[]>;
 }
 
-/**
- * Fact-table metadata: describes the grain + numeric fact columns (measures).
- */
-export interface FactMeasureDefinition {
-  /** Column name in the raw fact rows */
-  column: string;
-  /** Default aggregation (e.g., "sum", "avg", "count") */
-  defaultAgg: "sum" | "avg" | "count";
-  /** Optional default format (currency, integer, percent, etc.) */
+export interface TableColumn {
+  role: "attribute" | "measure";
+  dataType?: "string" | "number" | "date";
+  defaultAgg?: "sum" | "avg" | "count" | "min" | "max";
   format?: string;
-  /** Optional description */
-  description?: string;
+  labelFor?: string;
+  labelAlias?: string;
 }
 
-export interface FactTableDefinition {
-  /** Native grain of the fact table (dimension keys present in rows) */
+export interface TableDefinition {
+  name: string;
   grain: string[];
-  /** Measure definitions (fact columns) */
-  measures: Record<string, FactMeasureDefinition>;
+  columns: Record<string, TableColumn>;
+  relationships?: Record<string, { references: string; column: string }>;
 }
 
-export type FactTableRegistry = Record<string, FactTableDefinition>;
-
-/**
- * Dimension config for label enrichment.
- * Maps a dimension key (e.g., "regionId") to its lookup table and label.
- */
-export interface DimensionConfigEntry {
-  table: string;      // "regions"
-  key: string;        // "regionId"
-  labelProp: string;  // "name"
-  labelAlias: string; // "regionName"
-}
-
-export type DimensionConfig = Record<string, DimensionConfigEntry>;
+export type TableDefinitionRegistry = Record<string, TableDefinition>;
 
 /**
  * Metric definitions
@@ -156,12 +78,12 @@ interface MetricBase {
  */
 export interface FactMeasureMetric extends MetricBase {
   kind: "factMeasure";
-  factTable: string;
-  factColumn: string; // key into FactTableDefinition.measures
-  agg?: "sum" | "avg" | "count"; // default from fact column if omitted
+  table: string;
+  column: string; // key into TableDefinition.columns
+  agg?: "sum" | "avg" | "count" | "min" | "max"; // default from column if omitted
   /**
    * Metric grain: which dimensions from the filter context affect this metric.
-   * If omitted, defaults to the fact table's grain.
+   * If omitted, defaults to the table's grain.
    */
   grain?: string[];
 }
@@ -171,10 +93,10 @@ export interface FactMeasureMetric extends MetricBase {
  */
 export interface ExpressionMetric extends MetricBase {
   kind: "expression";
-  factTable: string;
+  table: string;
   /**
    * Metric grain; controls which filters are respected/ignored.
-   * If omitted, defaults to the fact table's grain.
+   * If omitted, defaults to the table's grain.
    */
   grain?: string[];
   /**
@@ -279,24 +201,24 @@ export function matchesFilter(value: any, filter: FilterValue): boolean {
 }
 
 /**
- * Apply a filter context to a fact table,
+ * Apply a filter context to a table,
  * respecting only the dimensions in `grain`.
  */
-export function applyContextToFact(
+export function applyContextToTable(
   rows: Row[],
   context: FilterContext,
   grain: string[]
 ): RowSequence {
-  let q = RowSequence.from(rows);
+  let sequence = rowsToEnumerable(rows);
 
   Object.entries(context || {}).forEach(([key, filter]) => {
     if (filter === undefined || filter === null) return;
-    if (!grain.includes(key)) return; // ignore filters this metric doesn't care about
+    if (!grain.includes(key)) return;
 
-    q = q.where((r: Row) => matchesFilter(r[key], filter));
+    sequence = sequence.where((r: Row) => matchesFilter(r[key], filter));
   });
 
-  return q;
+  return sequence;
 }
 
 /**
@@ -311,25 +233,80 @@ export function pick(obj: Row, keys: string[]): Row {
 }
 
 /**
- * Enrich dimension keys with their label fields, using dimensionConfig.
+ * Enrich dimension keys with their label fields defined in table metadata.
  */
+interface LabelColumnInfo {
+  tableName: string;
+  columnName: string;
+  matchColumn: string;
+  alias?: string;
+}
+
+function buildLabelColumnIndex(
+  tableDefinitions: TableDefinitionRegistry
+): Map<string, LabelColumnInfo[]> {
+  const map = new Map<string, LabelColumnInfo[]>();
+
+  for (const [tableName, tableDef] of Object.entries(tableDefinitions)) {
+    for (const [columnName, columnDef] of Object.entries(tableDef.columns)) {
+      if (!columnDef.labelFor) continue;
+      const entry: LabelColumnInfo = {
+        tableName,
+        columnName,
+        matchColumn: columnDef.labelFor,
+        alias: columnDef.labelAlias ?? columnName,
+      };
+      const existing = map.get(columnDef.labelFor) ?? [];
+      existing.push(entry);
+      map.set(columnDef.labelFor, existing);
+    }
+  }
+
+  return map;
+}
+
+const labelIndexCache = new WeakMap<
+  TableDefinitionRegistry,
+  Map<string, LabelColumnInfo[]>
+>();
+
+function getLabelColumnIndex(
+  tableDefinitions: TableDefinitionRegistry
+): Map<string, LabelColumnInfo[]> {
+  let cached = labelIndexCache.get(tableDefinitions);
+  if (!cached) {
+    cached = buildLabelColumnIndex(tableDefinitions);
+    labelIndexCache.set(tableDefinitions, cached);
+  }
+  return cached;
+}
+
 export function enrichDimensions(
   keyObj: Row,
   db: InMemoryDb,
-  dimensionConfig: DimensionConfig
+  tableDefinitions: TableDefinitionRegistry
 ): Row {
   const result: Row = { ...keyObj };
-  for (const [dimKey, cfg] of Object.entries(dimensionConfig)) {
-    if (keyObj[dimKey] == null) continue;
+  const labelIndex = getLabelColumnIndex(tableDefinitions);
 
-    const dimTable = db.dimensions[cfg.table];
-    if (!dimTable) continue;
+  for (const [dimKey, value] of Object.entries(keyObj)) {
+    if (value == null) continue;
+    const labelColumns = labelIndex.get(dimKey);
+    if (!labelColumns) continue;
 
-    const match = dimTable.find((d) => d[cfg.key] === keyObj[dimKey]);
-    if (match) {
-      result[cfg.labelAlias] = match[cfg.labelProp];
+    for (const columnInfo of labelColumns) {
+      const lookupRows = db.tables[columnInfo.tableName];
+      if (!lookupRows) continue;
+      const match = lookupRows.find(
+        (row) => row[columnInfo.matchColumn] === value
+      );
+      if (match && match[columnInfo.columnName] !== undefined) {
+        result[columnInfo.alias ?? columnInfo.columnName] =
+          match[columnInfo.columnName];
+      }
     }
   }
+
   return result;
 }
 
@@ -347,7 +324,7 @@ function cacheKey(metricName: string, context: FilterContext): string {
 export function evaluateMetric(
   metricName: string,
   db: InMemoryDb,
-  factTables: FactTableRegistry,
+  tableDefinitions: TableDefinitionRegistry,
   metricRegistry: MetricRegistry,
   context: FilterContext,
   transforms: ContextTransformsRegistry,
@@ -366,44 +343,72 @@ export function evaluateMetric(
   let value: number | null;
 
   if (def.kind === "factMeasure") {
-    const factDef = factTables[def.factTable];
-    if (!factDef) throw new Error(`Unknown fact table: ${def.factTable}`);
+    const tableDef = tableDefinitions[def.table];
+    if (!tableDef) throw new Error(`Unknown table: ${def.table}`);
 
-    const rows = db.facts[def.factTable];
-    if (!rows) throw new Error(`Missing rows for fact table: ${def.factTable}`);
+    const rows = db.tables[def.table];
+    if (!rows) throw new Error(`Missing rows for table: ${def.table}`);
 
-    const grain = def.grain ?? factDef.grain;
-    const q = applyContextToFact(rows, context, grain);
+    const grain = def.grain ?? tableDef.grain;
+    const sequence = applyContextToTable(rows, context, grain);
 
-    const factMeasureDef = factDef.measures[def.factColumn];
-    if (!factMeasureDef) {
-      throw new Error(`Unknown fact column '${def.factColumn}' for table '${def.factTable}'`);
+    const columnDef = tableDef.columns[def.column];
+    if (!columnDef) {
+      throw new Error(`Unknown column '${def.column}' for table '${def.table}'`);
     }
-    const col = factMeasureDef.column;
-    const agg = def.agg ?? factMeasureDef.defaultAgg;
+    if (columnDef.role !== "measure") {
+      throw new Error(
+        `Column '${def.column}' on table '${def.table}' is not a measure`
+      );
+    }
+
+    const agg = def.agg ?? columnDef.defaultAgg ?? "sum";
+    const pickValue = (row: Row): number | null => {
+      const raw = Number(row[def.column]);
+      return Number.isNaN(raw) ? null : raw;
+    };
 
     switch (agg) {
       case "sum":
-        value = q.sum((r: Row) => Number(r[col] ?? 0));
+        value = sequence.sum((r: Row) => pickValue(r) ?? 0);
         break;
-      case "avg":
-        value = q.average((r: Row) => Number(r[col] ?? 0));
+      case "avg": {
+        const count = sequence.count();
+        const total = sequence.sum((r: Row) => pickValue(r) ?? 0);
+        value = count === 0 ? null : total / count;
         break;
+      }
       case "count":
-        value = q.count();
+        value = sequence.count();
         break;
+      case "min": {
+        const values = sequence
+          .select((r: Row) => pickValue(r))
+          .where((num): num is number => typeof num === "number")
+          .toArray();
+        value = values.length === 0 ? null : Math.min(...values);
+        break;
+      }
+      case "max": {
+        const values = sequence
+          .select((r: Row) => pickValue(r))
+          .where((num): num is number => typeof num === "number")
+          .toArray();
+        value = values.length === 0 ? null : Math.max(...values);
+        break;
+      }
       default:
         throw new Error(`Unsupported aggregation: ${agg}`);
     }
   } else if (def.kind === "expression") {
-    const factDef = factTables[def.factTable];
-    if (!factDef) throw new Error(`Unknown fact table: ${def.factTable}`);
+    const tableDef = tableDefinitions[def.table];
+    if (!tableDef) throw new Error(`Unknown table: ${def.table}`);
 
-    const rows = db.facts[def.factTable];
-    if (!rows) throw new Error(`Missing rows for fact table: ${def.factTable}`);
+    const rows = db.tables[def.table];
+    if (!rows) throw new Error(`Missing rows for table: ${def.table}`);
 
-    const grain = def.grain ?? factDef.grain;
-    const q = applyContextToFact(rows, context, grain);
+    const grain = def.grain ?? tableDef.grain;
+    const q = applyContextToTable(rows, context, grain);
     value = def.expression(q, db, context);
 
   } else if (def.kind === "derived") {
@@ -412,7 +417,7 @@ export function evaluateMetric(
       depValues[dep] = evaluateMetric(
         dep,
         db,
-        factTables,
+        tableDefinitions,
         metricRegistry,
         context,
         transforms,
@@ -430,7 +435,7 @@ export function evaluateMetric(
     value = evaluateMetric(
       def.baseMeasure,
       db,
-      factTables,
+      tableDefinitions,
       metricRegistry,
       transformedContext,
       transforms,
@@ -451,7 +456,7 @@ export function evaluateMetric(
 export function evaluateMetrics(
   metricNames: string[],
   db: InMemoryDb,
-  factTables: FactTableRegistry,
+  tableDefinitions: TableDefinitionRegistry,
   metricRegistry: MetricRegistry,
   context: FilterContext,
   transforms: ContextTransformsRegistry
@@ -462,7 +467,7 @@ export function evaluateMetrics(
     results[m] = evaluateMetric(
       m,
       db,
-      factTables,
+      tableDefinitions,
       metricRegistry,
       context,
       transforms,
@@ -476,33 +481,31 @@ export function evaluateMetrics(
  * Build a dimensioned result set: rows by dimension keys + metrics.
  */
 export interface RunQueryOptions {
-  rows: string[];         // dimension keys for row axis, e.g. ["regionId", "productId"]
+  rows: string[]; // dimension keys for row axis
   filters?: FilterContext;
-  metrics: string[];      // metric IDs
-  factForRows: string;    // fact table used to find distinct row combinations
+  metrics: string[]; // metric IDs
+  tableForRows: string; // table used to find distinct row combinations
 }
 
 export function runQuery(
   db: InMemoryDb,
-  factTables: FactTableRegistry,
+  tableDefinitions: TableDefinitionRegistry,
   metricRegistry: MetricRegistry,
   transforms: ContextTransformsRegistry,
-  dimensionConfig: DimensionConfig,
   options: RunQueryOptions
 ): Row[] {
-  const { rows: rowDims, filters = {}, metrics, factForRows } = options;
+  const { rows: rowDims, filters = {}, metrics, tableForRows } = options;
 
-  const factRows = db.facts[factForRows];
-  if (!factRows) throw new Error(`Unknown fact table: ${factForRows}`);
+  const tableDef = tableDefinitions[tableForRows];
+  if (!tableDef) throw new Error(`Unknown table: ${tableForRows}`);
 
-  const factGrain = Object.keys(factRows[0] || {});
-  const filtered = applyContextToFact(factRows, filters, factGrain);
+  const tableRows = db.tables[tableForRows];
+  if (!tableRows) throw new Error(`Missing rows for table: ${tableForRows}`);
+
+  const filtered = applyContextToTable(tableRows, filters, tableDef.grain);
 
   const groups = filtered
-    .groupBy(
-      (r: Row) => JSON.stringify(pick(r, rowDims)),
-      (r: Row) => r
-    )
+    .groupBy((r: Row) => JSON.stringify(pick(r, rowDims)))
     .toArray();
 
   const cache = new Map<string, number | null>();
@@ -520,7 +523,7 @@ export function runQuery(
       const numericValue = evaluateMetric(
         m,
         db,
-        factTables,
+        tableDefinitions,
         metricRegistry,
         rowContext,
         transforms,
@@ -530,7 +533,7 @@ export function runQuery(
       metricValues[m] = formatValue(numericValue, def.format);
     }
 
-    const dimPart = enrichDimensions(keyObj, db, dimensionConfig);
+    const dimPart = enrichDimensions(keyObj, db, tableDefinitions);
     result.push({
       ...dimPart,
       ...metricValues,
@@ -549,17 +552,15 @@ export function runQuery(
  * Example in-memory DB for the POC.
  */
 export const demoDb: InMemoryDb = {
-  dimensions: {
+  tables: {
     products: [
-      { productId: 1, name: "Widget A" },
-      { productId: 2, name: "Widget B" },
+      { productId: 1, productName: "Widget A" },
+      { productId: 2, productName: "Widget B" },
     ],
     regions: [
-      { regionId: "NA", name: "North America" },
-      { regionId: "EU", name: "Europe" },
+      { regionId: "NA", regionName: "North America" },
+      { regionId: "EU", regionName: "Europe" },
     ],
-  },
-  facts: {
     sales: [
       // 2024
       { year: 2024, month: 1, regionId: "NA", productId: 1, quantity: 7, amount: 700 },
@@ -586,49 +587,73 @@ export const demoDb: InMemoryDb = {
 /**
  * Example fact-table metadata.
  */
-export const demoFactTables: FactTableRegistry = {
+export const demoTableDefinitions: TableDefinitionRegistry = {
   sales: {
+    name: "sales",
     grain: ["year", "month", "regionId", "productId"],
-    measures: {
-      amount: {
-        column: "amount",
-        defaultAgg: "sum",
-        format: "currency",
-      },
+    columns: {
+      year: { role: "attribute", dataType: "number" },
+      month: { role: "attribute", dataType: "number" },
+      regionId: { role: "attribute", dataType: "string" },
+      productId: { role: "attribute", dataType: "number" },
       quantity: {
-        column: "quantity",
+        role: "measure",
+        dataType: "number",
         defaultAgg: "sum",
         format: "integer",
       },
-    },
-  },
-  budget: {
-    grain: ["year", "regionId"],
-    measures: {
-      budgetAmount: {
-        column: "budgetAmount",
+      amount: {
+        role: "measure",
+        dataType: "number",
         defaultAgg: "sum",
         format: "currency",
       },
     },
+    relationships: {
+      region: { references: "regions", column: "regionId" },
+      product: { references: "products", column: "productId" },
+    },
   },
-};
-
-/**
- * Example dimension config for label enrichment.
- */
-export const demoDimensionConfig: DimensionConfig = {
-  regionId: {
-    table: "regions",
-    key: "regionId",
-    labelProp: "name",
-    labelAlias: "regionName",
+  budget: {
+    name: "budget",
+    grain: ["year", "regionId"],
+    columns: {
+      year: { role: "attribute", dataType: "number" },
+      regionId: { role: "attribute", dataType: "string" },
+      budgetAmount: {
+        role: "measure",
+        dataType: "number",
+        defaultAgg: "sum",
+        format: "currency",
+      },
+    },
+    relationships: {
+      region: { references: "regions", column: "regionId" },
+    },
   },
-  productId: {
-    table: "products",
-    key: "productId",
-    labelProp: "name",
-    labelAlias: "productName",
+  regions: {
+    name: "regions",
+    grain: ["regionId"],
+    columns: {
+      regionId: { role: "attribute", dataType: "string" },
+      regionName: {
+        role: "attribute",
+        dataType: "string",
+        labelFor: "regionId",
+      },
+    },
+  },
+  products: {
+    name: "products",
+    grain: ["productId"],
+    columns: {
+      productId: { role: "attribute", dataType: "number" },
+      productName: {
+        role: "attribute",
+        dataType: "string",
+        labelFor: "productId",
+      },
+    },
   },
 };
 
@@ -681,18 +706,18 @@ function buildDemoMetrics() {
     kind: "factMeasure",
     name: "totalSalesAmount",
     description: "Sum of sales amount over the current context.",
-    factTable: "sales",
-    factColumn: "amount",
+    table: "sales",
+    column: "amount",
     format: "currency",
-    // grain omitted → defaults to factTables.sales.grain
+    // grain omitted → defaults to tableDefinitions.sales.grain
   };
 
   demoMetrics.totalSalesQuantity = {
     kind: "factMeasure",
     name: "totalSalesQuantity",
     description: "Sum of sales quantity.",
-    factTable: "sales",
-    factColumn: "quantity",
+    table: "sales",
+    column: "quantity",
     format: "integer",
   };
 
@@ -700,10 +725,10 @@ function buildDemoMetrics() {
     kind: "factMeasure",
     name: "totalBudget",
     description: "Total budget at (year, region) grain; ignores product/month filters.",
-    factTable: "budget",
-    factColumn: "budgetAmount",
+    table: "budget",
+    column: "budgetAmount",
     format: "currency",
-    // grain omitted → defaults to factTables.budget.grain
+    // grain omitted → defaults to tableDefinitions.budget.grain
   };
 
   // Fact measure with coarser metric grain (like MicroStrategy level metric)
@@ -711,8 +736,8 @@ function buildDemoMetrics() {
     kind: "factMeasure",
     name: "salesAmountYearRegion",
     description: "Sales aggregated at (year, region) level; ignores month and product filters.",
-    factTable: "sales",
-    factColumn: "amount",
+    table: "sales",
+    column: "amount",
     format: "currency",
     grain: ["year", "regionId"],
   };
@@ -722,9 +747,9 @@ function buildDemoMetrics() {
     kind: "expression",
     name: "pricePerUnit",
     description: "Sales amount / quantity over the current context.",
-    factTable: "sales",
+    table: "sales",
     format: "currency",
-    expression: (q: any) => {
+    expression: (q: RowSequence) => {
       const amount = q.sum((r: Row) => Number(r.amount ?? 0));
       const qty = q.sum((r: Row) => Number(r.quantity ?? 0));
       return qty ? amount / qty : null;
@@ -811,7 +836,7 @@ buildDemoMetrics();
  *
  * This is just to illustrate. In a real application you'd likely:
  * - import the library parts
- * - define your own db, factTables, dimensionConfig, metrics
+ * - define your own db, tableDefinitions, metrics
  * - call runQuery() from your UI / API layer
  */
 
@@ -834,15 +859,14 @@ if (typeof require !== "undefined" && typeof module !== "undefined" && require.m
   console.log("\n=== Demo: 2025-02, Region x Product ===");
   const result1 = runQuery(
     demoDb,
-    demoFactTables,
+    demoTableDefinitions,
     demoMetrics,
     demoTransforms,
-    demoDimensionConfig,
     {
       rows: ["regionId", "productId"],
       filters: { year: 2025, month: 2 },
       metrics: metricBundle,
-      factForRows: "sales",
+      tableForRows: "sales",
     }
   );
   // eslint-disable-next-line no-console
@@ -851,15 +875,14 @@ if (typeof require !== "undefined" && typeof module !== "undefined" && require.m
   console.log("\n=== Demo: 2025-02, Region only ===");
   const result2 = runQuery(
     demoDb,
-    demoFactTables,
+    demoTableDefinitions,
     demoMetrics,
     demoTransforms,
-    demoDimensionConfig,
     {
       rows: ["regionId"],
       filters: { year: 2025, month: 2 },
       metrics: metricBundle,
-      factForRows: "sales",
+      tableForRows: "sales",
     }
   );
   // eslint-disable-next-line no-console
@@ -868,15 +891,14 @@ if (typeof require !== "undefined" && typeof module !== "undefined" && require.m
   console.log("\n=== Demo: 2025-02, Region=NA, by Product ===");
   const result3 = runQuery(
     demoDb,
-    demoFactTables,
+    demoTableDefinitions,
     demoMetrics,
     demoTransforms,
-    demoDimensionConfig,
     {
       rows: ["productId"],
       filters: { year: 2025, month: 2, regionId: "NA" },
       metrics: metricBundle,
-      factForRows: "sales",
+      tableForRows: "sales",
     }
   );
   // eslint-disable-next-line no-console
