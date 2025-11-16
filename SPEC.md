@@ -8,6 +8,27 @@ Document the implementation plan for the two outstanding objectives:
 
 This spec elaborates the design, key changes, data migrations, testing plans, and open questions needed to complete both efforts.
 
+## Progress Checklist
+
+### Objective 1 — Adopt `linq.js`
+- [x] Bundled `Enumerable` is imported inside `semanticEngine.ts` along with the `rowsToEnumerable` helper so every caller works with fluent LINQ sequences.
+- [x] The bespoke `RowSequence` implementation has been removed in favor of the `Enumerable` return type, and all callers (`applyContextToTable`, metric evaluators, transforms) now operate directly on those sequences.
+- [x] Execution paths such as `applyContextToTable` and `runQuery` return `Enumerable` instances and compose `where`, `select`, `groupBy`, and aggregate helpers instead of mutating arrays.
+- [x] The repository ships with `src/linq.d.ts`, providing the typings required for the imported operators to satisfy TypeScript.
+- [ ] Add additional regression coverage that specifically exercises the newly available LINQ helpers (e.g., joins, ordering, nested groupings) beyond the existing unit tests.
+
+### Objective 2 — Unify Tables
+- [x] Demo data lives under a single `db.tables` map, and the engine code consumes the unified structure throughout.
+- [x] Table metadata is defined through `tableDefinitions` so attributes, measures, relationships, and labels are all described in one place instead of the former fact/dimension split.
+- [x] Query APIs (metrics, helper functions, and `runQuery`) reference `table`/`tableForRows` consistently, eliminating the previous `fact*` terminology.
+- [x] Execution logic (filtering, grouping, label enrichment) reads from the unified metadata to determine grain and lookup joins.
+- [ ] Produce migration guidance / changelog notes that explain how downstream callers should update from `db.dimensions` + `db.facts` to the new unified table layout.
+
+### Combined Testing & Documentation
+- [x] Automated tests (`npm test`) cover the LINQ-powered helpers, unified metadata, and context transforms.
+- [ ] Perform and document manual regression steps (previously planned for the `/web` playground) so contributors know how to validate behavioral parity outside of the test suite.
+- [ ] Resolve the open architectural questions (relationship declaration model, multi-table join scope, handling duplicate measures) and codify the decisions in this spec.
+
 ## Current State Summary
 - `src/semanticEngine.ts` exports the in-memory DB, fact metadata, metric definitions, and helpers (`runQuery`, `applyContextToFact`, etc.).
 - Row operations are powered by a light wrapper (`RowSequence`) that mimics a subset of LINQ behavior. Most metrics manually aggregate arrays, limiting composability.
