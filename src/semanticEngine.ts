@@ -22,7 +22,7 @@ export type RowSequence = ReturnType<typeof rowsToEnumerable>;
  * - primitive equality (year = 2025, regionId = 'NA')
  * - range/comparison for numeric-like fields (month <= 6, etc.)
  */
-export type FilterPrimitive = string | number | boolean;
+export type FilterPrimitive = string | number | boolean | Date;
 export interface FilterRange {
   from?: number;
   to?: number;
@@ -31,8 +31,130 @@ export interface FilterRange {
   gt?: number;
   lt?: number;
 }
-export type FilterValue = FilterPrimitive | FilterRange;
-export type FilterContext = Record<string, FilterValue>;
+export type FilterValue = FilterPrimitive | FilterRange | FilterPrimitive[];
+
+export type ScalarOp = "eq" | "lt" | "lte" | "gt" | "gte" | "between" | "in";
+
+export interface FilterExpression {
+  kind: "expression";
+  field: string;
+  op: ScalarOp;
+  value: any;
+  value2?: any;
+}
+
+export interface FilterConjunction {
+  kind: "and" | "or";
+  filters: FilterNode[];
+}
+
+export type FilterNode = FilterExpression | FilterConjunction;
+
+export type FilterObject = Record<string, FilterValue>;
+export type FilterContext = FilterNode | FilterObject | undefined;
+
+export const f = {
+  eq(field: string, value: FilterPrimitive): FilterExpression {
+    return { kind: "expression", field, op: "eq", value };
+  },
+  lt(field: string, value: number): FilterExpression {
+    return { kind: "expression", field, op: "lt", value };
+  },
+  lte(field: string, value: number): FilterExpression {
+    return { kind: "expression", field, op: "lte", value };
+  },
+  gt(field: string, value: number): FilterExpression {
+    return { kind: "expression", field, op: "gt", value };
+  },
+  gte(field: string, value: number): FilterExpression {
+    return { kind: "expression", field, op: "gte", value };
+  },
+  between(field: string, from: number, to: number): FilterExpression {
+    return { kind: "expression", field, op: "between", value: from, value2: to };
+  },
+  in(field: string, values: FilterPrimitive[]): FilterExpression {
+    return { kind: "expression", field, op: "in", value: values };
+  },
+  and(...filters: FilterNode[]): FilterConjunction {
+    return { kind: "and", filters };
+  },
+  or(...filters: FilterNode[]): FilterConjunction {
+    return { kind: "or", filters };
+  },
+};
+
+function isFilterNode(node: FilterContext): node is FilterNode {
+  if (!node) return false;
+  return (node as FilterExpression | FilterConjunction).kind !== undefined;
+}
+
+function normalizeFilterContext(ctx: FilterContext): FilterNode | undefined {
+  if (!ctx) return undefined;
+  if (isFilterNode(ctx)) return ctx;
+  const entries = Object.entries(ctx ?? {});
+  if (!entries.length) return undefined;
+  const filters = entries
+    .map(([field, value]) => convertFilterValueToExpression(field, value))
+    .filter((expr): expr is FilterExpression => Boolean(expr));
+  if (!filters.length) return undefined;
+  if (filters.length === 1) return filters[0];
+  return f.and(...filters);
+}
+
+function convertFilterValueToExpression(
+  field: string,
+  value: FilterValue
+): FilterExpression | undefined {
+  if (value == null) return undefined;
+  if (Array.isArray(value)) {
+    return f.in(field, value);
+  }
+  if (typeof value === "object") {
+    const range = value as FilterRange;
+    if (range.from != null && range.to != null) {
+      return f.between(field, Number(range.from), Number(range.to));
+    }
+    if (range.gte != null) {
+      return f.gte(field, Number(range.gte));
+    }
+    if (range.lte != null) {
+      return f.lte(field, Number(range.lte));
+    }
+    if (range.gt != null) {
+      return f.gt(field, Number(range.gt));
+    }
+    if (range.lt != null) {
+      return f.lt(field, Number(range.lt));
+    }
+    if (range.from != null) {
+      return f.gte(field, Number(range.from));
+    }
+    if (range.to != null) {
+      return f.lte(field, Number(range.to));
+    }
+    return undefined;
+  }
+  return f.eq(field, value);
+}
+
+export function mergeFilters(
+  ...contexts: (FilterContext | undefined)[]
+): FilterContext | undefined {
+  const nodes = contexts
+    .map((ctx) => normalizeFilterContext(ctx))
+    .filter((node): node is FilterNode => Boolean(node));
+  if (!nodes.length) return undefined;
+  if (nodes.length === 1) return nodes[0];
+  const merged: FilterConjunction = { kind: "and", filters: [] };
+  nodes.forEach((node) => {
+    if (node.kind === "and") {
+      merged.filters.push(...node.filters);
+    } else {
+      merged.filters.push(node);
+    }
+  });
+  return merged;
+}
 
 /**
  * In-memory DB storing raw table rows.
@@ -59,98 +181,164 @@ export interface TableDefinition {
 
 export type TableDefinitionRegistry = Record<string, TableDefinition>;
 
+export interface AttributeDefinition {
+  name: string;
+  table: string;
+  column?: string;
+  description?: string;
+}
+
+export type AttributeRegistry = Record<string, AttributeDefinition>;
+
+export interface MeasureDefinition {
+  name: string;
+  table: string;
+  column?: string;
+  aggregation?: "sum" | "avg" | "count" | "min" | "max";
+  format?: string;
+  description?: string;
+  grain?: string[];
+}
+
+export type MeasureRegistry = Record<string, MeasureDefinition>;
+
+export const attr = {
+  id(opts: AttributeDefinition): AttributeDefinition {
+    return {
+      ...opts,
+      column: opts.column ?? opts.name,
+    };
+  },
+};
+
+export const measure = {
+  sum(opts: MeasureDefinition): MeasureDefinition {
+    return {
+      ...opts,
+      column: opts.column ?? opts.name,
+      aggregation: opts.aggregation ?? "sum",
+    };
+  },
+  count(opts: MeasureDefinition): MeasureDefinition {
+    return {
+      ...opts,
+      aggregation: "count",
+    };
+  },
+};
+
+export interface SemanticModel {
+  tables: TableDefinitionRegistry;
+  attributes: AttributeRegistry;
+  measures: MeasureRegistry;
+  metrics: MetricRegistry;
+  transforms: ContextTransformsRegistry;
+}
+
 /**
  * Metric definitions
  */
 
-// Common base for all metric definitions
 interface MetricBase {
-  /** Unique ID / registry key (not required on type, but used by registry) */
   name: string;
-  /** Human description */
   description?: string;
-  /** Suggested format (currency, integer, percent, etc.) */
   format?: string;
-}
-
-/**
- * Metric evaluated directly from a single fact column with a simple aggregation.
- */
-export interface FactMeasureMetric extends MetricBase {
-  kind: "factMeasure";
-  table: string;
-  column: string; // key into TableDefinition.columns
-  agg?: "sum" | "avg" | "count" | "min" | "max"; // default from column if omitted
-  /**
-   * Metric grain: which dimensions from the filter context affect this metric.
-   * If omitted, defaults to the table's grain.
-   */
   grain?: string[];
 }
 
-/**
- * Metric evaluated with a custom expression over the filtered fact rows.
- */
-export interface ExpressionMetric extends MetricBase {
-  kind: "expression";
-  table: string;
-  /**
-   * Metric grain; controls which filters are respected/ignored.
-   * If omitted, defaults to the table's grain.
-   */
+export interface MetricContext {
+  filter?: FilterContext;
   grain?: string[];
-  /**
-   * Custom aggregator: receives a LINQ sequence over filtered fact rows.
-   * Returns a numeric value or null.
-   */
-  expression: (q: RowSequence, db: InMemoryDb, context: FilterContext) => number | null;
 }
 
-/**
- * Metric that depends on other metrics.
- * The engine evaluates its dependencies first.
- */
-export interface DerivedMetric extends MetricBase {
-  kind: "derived";
-  dependencies: string[]; // metric IDs
-  evalFromDeps: (
-    depValues: Record<string, number | null>,
-    db: InMemoryDb,
-    context: FilterContext
-  ) => number | null;
+export type MetricEval = (
+  ctx: MetricContext,
+  runtime: MetricRuntime
+) => number | null;
+
+export interface MetricDefinition extends MetricBase {
+  eval: MetricEval;
+  deps?: string[];
 }
 
-/**
- * Metric that wraps another metric and applies a context transform
- * (e.g., YTD, LastYear, YTDLastYear).
- */
-export interface ContextTransformMetric extends MetricBase {
-  kind: "contextTransform";
-  baseMeasure: string;   // metric ID
-  transform: string;     // key into ContextTransformsRegistry
-}
-
-/**
- * Union of all metric definitions.
- */
-export type MetricDefinition =
-  | FactMeasureMetric
-  | ExpressionMetric
-  | DerivedMetric
-  | ContextTransformMetric;
-
-/**
- * Metric registry: id -> metric definition.
- */
 export type MetricRegistry = Record<string, MetricDefinition>;
 
-/**
- * Context-transform functions (time intelligence, etc.).
- * Input: current filter context
- * Output: transformed filter context
- */
-export type ContextTransformFn = (ctx: FilterContext) => FilterContext;
-export type ContextTransformsRegistry = Record<string, ContextTransformFn>;
+export type ContextTransform = (ctx: MetricContext) => MetricContext;
+export type ContextTransformsRegistry = Record<string, ContextTransform>;
+
+export function composeTransforms(
+  ...transforms: ContextTransform[]
+): ContextTransform {
+  return (ctx: MetricContext) =>
+    transforms.reduce((acc, transform) => transform(acc), ctx);
+}
+
+export function simpleMetric(opts: {
+  name: string;
+  measure: string;
+  description?: string;
+  format?: string;
+  grain?: string[];
+}): MetricDefinition {
+  return {
+    name: opts.name,
+    description: opts.description,
+    format: opts.format,
+    grain: opts.grain,
+    eval: (ctx, runtime) => runtime.evaluateMeasure(opts.measure, ctx),
+  };
+}
+
+export function derivedMetric(opts: {
+  name: string;
+  deps: string[];
+  combine: (values: Record<string, number | null>) => number | null;
+  description?: string;
+  format?: string;
+  grain?: string[];
+}): MetricDefinition {
+  return {
+    name: opts.name,
+    description: opts.description,
+    format: opts.format,
+    grain: opts.grain,
+    deps: opts.deps,
+    eval: (ctx, runtime) => {
+      const values: Record<string, number | null> = {};
+      opts.deps.forEach((dep) => {
+        values[dep] = runtime.evaluate(dep, ctx);
+      });
+      return opts.combine(values);
+    },
+  };
+}
+
+export function contextTransformMetric(opts: {
+  name: string;
+  baseMetric: string;
+  transform: ContextTransform;
+  description?: string;
+  format?: string;
+}): MetricDefinition {
+  return {
+    name: opts.name,
+    description: opts.description,
+    format: opts.format,
+    deps: [opts.baseMetric],
+    eval: (ctx, runtime) => runtime.evaluate(opts.baseMetric, opts.transform(ctx)),
+  };
+}
+
+interface MetricEvaluationEnvironment {
+  db: InMemoryDb;
+  model: SemanticModel;
+}
+
+export interface MetricRuntime {
+  evaluate(metricName: string, ctx: MetricContext): number | null;
+  evaluateMeasure(measureName: string, ctx: MetricContext): number | null;
+  env: MetricEvaluationEnvironment;
+}
 
 /**
  * Formatting helper: interpret a numeric value using metric format.
@@ -175,29 +363,137 @@ export function formatValue(value: number | null | undefined, format?: string): 
  */
 
 // Match a value to a filter (primitive or range/comparison)
-export function matchesFilter(value: any, filter: FilterValue): boolean {
-  if (
-    filter != null &&
-    typeof filter === "object" &&
-    !Array.isArray(filter)
-  ) {
-    const f = filter as FilterRange;
-
-    if ("from" in f || "to" in f) {
-      if (f.from != null && value < f.from) return false;
-      if (f.to != null && value > f.to) return false;
-      return true;
-    }
-
-    if (f.gte != null && value < f.gte) return false;
-    if (f.lte != null && value > f.lte) return false;
-    if (f.gt != null && value <= f.gt) return false;
-    if (f.lt != null && value >= f.lt) return false;
-    return true;
+function matchesExpression(value: any, expr: FilterExpression): boolean {
+  switch (expr.op) {
+    case "eq":
+      return value === expr.value;
+    case "lt":
+      return value < expr.value;
+    case "lte":
+      return value <= expr.value;
+    case "gt":
+      return value > expr.value;
+    case "gte":
+      return value >= expr.value;
+    case "between":
+      return value >= expr.value && value <= expr.value2;
+    case "in":
+      if (!Array.isArray(expr.value)) return false;
+      return expr.value.includes(value);
+    default:
+      return false;
   }
+}
 
-  // Primitive equality
-  return value === filter;
+function pruneFilterNode(
+  node: FilterNode,
+  allowed: Set<string>
+): FilterNode | undefined {
+  if (node.kind === "expression") {
+    return allowed.has(node.field) ? node : undefined;
+  }
+  const children = node.filters
+    .map((child) => pruneFilterNode(child, allowed))
+    .filter((child): child is FilterNode => Boolean(child));
+  if (!children.length) return undefined;
+  if (children.length === 1) return children[0];
+  return { ...node, filters: children };
+}
+
+function evaluateFilterNode(node: FilterNode, row: Row): boolean {
+  if (node.kind === "expression") {
+    return matchesExpression(row[node.field], node);
+  }
+  if (node.kind === "and") {
+    return node.filters.every((child) => evaluateFilterNode(child, row));
+  }
+  return node.filters.some((child) => evaluateFilterNode(child, row));
+}
+
+function omitFieldsFromNode(
+  node: FilterNode,
+  fields: Set<string>
+): FilterNode | undefined {
+  if (node.kind === "expression") {
+    return fields.has(node.field) ? undefined : node;
+  }
+  const children = node.filters
+    .map((child) => omitFieldsFromNode(child, fields))
+    .filter((child): child is FilterNode => Boolean(child));
+  if (!children.length) return undefined;
+  if (children.length === 1) return children[0];
+  return { ...node, filters: children };
+}
+
+export function omitFilterFields(
+  context: FilterContext | undefined,
+  ...fields: string[]
+): FilterContext | undefined {
+  const node = normalizeFilterContext(context);
+  if (!node) return undefined;
+  const result = omitFieldsFromNode(node, new Set(fields));
+  return result;
+}
+
+function expressionToFilterValue(
+  expr: FilterExpression
+): FilterValue | undefined {
+  switch (expr.op) {
+    case "eq":
+      return expr.value;
+    case "between":
+      return { from: expr.value, to: expr.value2 };
+    case "lt":
+      return { lt: expr.value };
+    case "lte":
+      return { lte: expr.value };
+    case "gt":
+      return { gt: expr.value };
+    case "gte":
+      return { gte: expr.value };
+    case "in":
+      return Array.isArray(expr.value) ? expr.value : [expr.value];
+    default:
+      return undefined;
+  }
+}
+
+function findFilterValueInNode(
+  node: FilterNode,
+  field: string
+): FilterValue | undefined {
+  if (node.kind === "expression") {
+    if (node.field === field) {
+      return expressionToFilterValue(node);
+    }
+    return undefined;
+  }
+  for (const child of node.filters) {
+    const found = findFilterValueInNode(child, field);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
+
+export function getFilterValue(
+  context: FilterContext | MetricContext | undefined,
+  field: string
+): FilterValue | undefined {
+  if (!context) return undefined;
+  const filterContext = (context as MetricContext).filter ?? context;
+  const node = normalizeFilterContext(filterContext as FilterContext);
+  if (!node) return undefined;
+  return findFilterValueInNode(node, field);
+}
+
+function asNumber(value: FilterValue | undefined): number | undefined {
+  if (value == null) return undefined;
+  if (typeof value === "number") return value;
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    return Number.isNaN(parsed) ? undefined : parsed;
+  }
+  return undefined;
 }
 
 /**
@@ -209,16 +505,87 @@ export function applyContextToTable(
   context: FilterContext,
   grain: string[]
 ): RowSequence {
-  let sequence = rowsToEnumerable(rows);
+  const node = normalizeFilterContext(context);
+  if (!node) return rowsToEnumerable(rows);
+  const allowed = new Set(grain);
+  const pruned = pruneFilterNode(node, allowed);
+  if (!pruned) return rowsToEnumerable(rows);
+  return rowsToEnumerable(rows).where((r: Row) => evaluateFilterNode(pruned, r));
+}
 
-  Object.entries(context || {}).forEach(([key, filter]) => {
-    if (filter === undefined || filter === null) return;
-    if (!grain.includes(key)) return;
+function serializeFilter(filter?: FilterContext): any {
+  if (!filter) return null;
+  const node = normalizeFilterContext(filter);
+  if (!node) return null;
+  return node;
+}
 
-    sequence = sequence.where((r: Row) => matchesFilter(r[key], filter));
-  });
+function mergeMetricContexts(
+  base: MetricContext,
+  override?: MetricContext
+): MetricContext {
+  if (!override) return base;
+  return {
+    filter: override.filter ?? base.filter,
+    grain: override.grain ?? base.grain,
+  };
+}
 
-  return sequence;
+function evaluateMeasureDefinition(
+  measureName: string,
+  ctx: MetricContext,
+  env: MetricEvaluationEnvironment
+): number | null {
+  const def = env.model.measures[measureName];
+  if (!def) {
+    throw new Error(`Unknown measure: ${measureName}`);
+  }
+  const tableDef = env.model.tables[def.table];
+  if (!tableDef) {
+    throw new Error(`Unknown table: ${def.table}`);
+  }
+  const rows = env.db.tables[def.table];
+  if (!rows) {
+    throw new Error(`Missing rows for table: ${def.table}`);
+  }
+
+  const grain = ctx.grain ?? def.grain ?? tableDef.grain;
+  const filtered = applyContextToTable(rows, ctx.filter, grain);
+
+  const aggregation = def.aggregation ?? "sum";
+  const column = def.column ?? def.name;
+  const pickValue = (row: Row): number | null => {
+    const raw = Number(row[column]);
+    return Number.isNaN(raw) ? null : raw;
+  };
+
+  switch (aggregation) {
+    case "sum":
+      return filtered.sum((r: Row) => pickValue(r) ?? 0);
+    case "avg": {
+      const count = filtered.count();
+      const total = filtered.sum((r: Row) => pickValue(r) ?? 0);
+      return count === 0 ? null : total / count;
+    }
+    case "count":
+      return filtered.count();
+    case "min": {
+      const values = filtered
+        .select((r: Row) => pickValue(r))
+        .where((num: number | null): num is number => typeof num === "number")
+        .toArray();
+      return values.length === 0 ? null : Math.min(...values);
+    }
+    case "max": {
+      const values = filtered
+        .select((r: Row) => pickValue(r))
+        .where((num: number | null): num is number => typeof num === "number")
+        .toArray();
+      return values.length === 0 ? null : Math.max(...values);
+    }
+    default:
+      throw new Error(`Unsupported aggregation: ${aggregation}`);
+  }
 }
 
 /**
@@ -314,8 +681,11 @@ export function enrichDimensions(
  * Metric evaluation engine
  */
 
-function cacheKey(metricName: string, context: FilterContext): string {
-  return `${metricName}::${JSON.stringify(context || {})}`;
+function metricCacheKey(metricName: string, context: MetricContext): string {
+  return `${metricName}::${JSON.stringify({
+    filter: serializeFilter(context.filter),
+    grain: context.grain ?? null,
+  })}`;
 }
 
 /**
@@ -323,129 +693,41 @@ function cacheKey(metricName: string, context: FilterContext): string {
  */
 export function evaluateMetric(
   metricName: string,
-  db: InMemoryDb,
-  tableDefinitions: TableDefinitionRegistry,
-  metricRegistry: MetricRegistry,
-  context: FilterContext,
-  transforms: ContextTransformsRegistry,
+  env: MetricEvaluationEnvironment,
+  context: MetricContext = {},
   cache: Map<string, number | null> = new Map()
 ): number | null {
-  const key = cacheKey(metricName, context);
+  const metric = env.model.metrics[metricName];
+  if (!metric) {
+    throw new Error(`Unknown metric: ${metricName}`);
+  }
+  const effectiveContext: MetricContext = {
+    filter: context.filter,
+    grain: context.grain ?? metric.grain,
+  };
+  const key = metricCacheKey(metricName, effectiveContext);
   if (cache.has(key)) {
     return cache.get(key) ?? null;
   }
 
-  const def = metricRegistry[metricName];
-  if (!def) {
-    throw new Error(`Unknown metric: ${metricName}`);
-  }
-
-  let value: number | null;
-
-  if (def.kind === "factMeasure") {
-    const tableDef = tableDefinitions[def.table];
-    if (!tableDef) throw new Error(`Unknown table: ${def.table}`);
-
-    const rows = db.tables[def.table];
-    if (!rows) throw new Error(`Missing rows for table: ${def.table}`);
-
-    const grain = def.grain ?? tableDef.grain;
-    const sequence = applyContextToTable(rows, context, grain);
-
-    const columnDef = tableDef.columns[def.column];
-    if (!columnDef) {
-      throw new Error(`Unknown column '${def.column}' for table '${def.table}'`);
-    }
-    if (columnDef.role !== "measure") {
-      throw new Error(
-        `Column '${def.column}' on table '${def.table}' is not a measure`
-      );
-    }
-
-    const agg = def.agg ?? columnDef.defaultAgg ?? "sum";
-    const pickValue = (row: Row): number | null => {
-      const raw = Number(row[def.column]);
-      return Number.isNaN(raw) ? null : raw;
-    };
-
-    switch (agg) {
-      case "sum":
-        value = sequence.sum((r: Row) => pickValue(r) ?? 0);
-        break;
-      case "avg": {
-        const count = sequence.count();
-        const total = sequence.sum((r: Row) => pickValue(r) ?? 0);
-        value = count === 0 ? null : total / count;
-        break;
-      }
-      case "count":
-        value = sequence.count();
-        break;
-      case "min": {
-        const values = sequence
-          .select((r: Row) => pickValue(r))
-          .where((num: number | null): num is number => typeof num === "number")
-          .toArray();
-        value = values.length === 0 ? null : Math.min(...values);
-        break;
-      }
-      case "max": {
-        const values = sequence
-          .select((r: Row) => pickValue(r))
-          .where((num: number | null): num is number => typeof num === "number")
-          .toArray();
-        value = values.length === 0 ? null : Math.max(...values);
-        break;
-      }
-      default:
-        throw new Error(`Unsupported aggregation: ${agg}`);
-    }
-  } else if (def.kind === "expression") {
-    const tableDef = tableDefinitions[def.table];
-    if (!tableDef) throw new Error(`Unknown table: ${def.table}`);
-
-    const rows = db.tables[def.table];
-    if (!rows) throw new Error(`Missing rows for table: ${def.table}`);
-
-    const grain = def.grain ?? tableDef.grain;
-    const q = applyContextToTable(rows, context, grain);
-    value = def.expression(q, db, context);
-
-  } else if (def.kind === "derived") {
-    const depValues: Record<string, number | null> = {};
-    for (const dep of def.dependencies) {
-      depValues[dep] = evaluateMetric(
-        dep,
-        db,
-        tableDefinitions,
-        metricRegistry,
-        context,
-        transforms,
+  const runtime: MetricRuntime = {
+    env,
+    evaluate: (name: string, ctx: MetricContext = {}) =>
+      evaluateMetric(
+        name,
+        env,
+        mergeMetricContexts(effectiveContext, ctx),
         cache
-      );
-    }
-    value = def.evalFromDeps(depValues, db, context);
+      ),
+    evaluateMeasure: (measureName: string, ctx: MetricContext = {}) =>
+      evaluateMeasureDefinition(
+        measureName,
+        mergeMetricContexts(effectiveContext, ctx),
+        env
+      ),
+  };
 
-  } else if (def.kind === "contextTransform") {
-    const transformFn = transforms[def.transform];
-    if (!transformFn) {
-      throw new Error(`Unknown context transform: ${def.transform}`);
-    }
-    const transformedContext = transformFn(context || {});
-    value = evaluateMetric(
-      def.baseMeasure,
-      db,
-      tableDefinitions,
-      metricRegistry,
-      transformedContext,
-      transforms,
-      cache
-    );
-  } else {
-    const exhaustiveCheck: never = def;
-    throw new Error(`Unknown metric kind: ${(exhaustiveCheck as any).kind}`);
-  }
-
+  const value = metric.eval(effectiveContext, runtime);
   cache.set(key, value);
   return value;
 }
@@ -455,85 +737,158 @@ export function evaluateMetric(
  */
 export function evaluateMetrics(
   metricNames: string[],
-  db: InMemoryDb,
-  tableDefinitions: TableDefinitionRegistry,
-  metricRegistry: MetricRegistry,
-  context: FilterContext,
-  transforms: ContextTransformsRegistry
+  env: MetricEvaluationEnvironment,
+  context: MetricContext = {}
 ): Record<string, number | null> {
   const cache = new Map<string, number | null>();
   const results: Record<string, number | null> = {};
   for (const m of metricNames) {
-    results[m] = evaluateMetric(
-      m,
-      db,
-      tableDefinitions,
-      metricRegistry,
-      context,
-      transforms,
-      cache
-    );
+    results[m] = evaluateMetric(m, env, context, cache);
   }
   return results;
 }
 
-/**
- * Build a dimensioned result set: rows by dimension keys + metrics.
- */
-export interface RunQueryOptions {
-  rows: string[]; // dimension keys for row axis
+export interface QuerySpec {
+  table: string;
+  attributes: string[];
+  metrics: string[];
   filters?: FilterContext;
-  metrics: string[]; // metric IDs
-  tableForRows: string; // table used to find distinct row combinations
 }
 
-export function runQuery(
-  db: InMemoryDb,
-  tableDefinitions: TableDefinitionRegistry,
-  metricRegistry: MetricRegistry,
-  transforms: ContextTransformsRegistry,
-  options: RunQueryOptions
+export interface QueryBuilder {
+  addAttributes(...attrs: string[]): QueryBuilder;
+  addMetrics(...metricNames: string[]): QueryBuilder;
+  where(filter: FilterContext): QueryBuilder;
+  build(): QuerySpec;
+  run(): Row[];
+}
+
+export interface Engine {
+  query(table: string): QueryBuilder;
+  run(spec: QuerySpec): Row[];
+  evaluateMetric(name: string, ctx?: MetricContext): number | null;
+  listMetrics(): MetricDefinition[];
+  getMetric(name: string): MetricDefinition | undefined;
+  readonly model: SemanticModel;
+}
+
+class EngineQueryBuilder implements QueryBuilder {
+  constructor(private engine: EngineImpl, private spec: QuerySpec) {}
+
+  private withSpec(partial: Partial<QuerySpec>): EngineQueryBuilder {
+    return new EngineQueryBuilder(this.engine, {
+      ...this.spec,
+      ...partial,
+    });
+  }
+
+  addAttributes(...attrs: string[]): QueryBuilder {
+    const merged = Array.from(new Set([...this.spec.attributes, ...attrs]));
+    return this.withSpec({ attributes: merged });
+  }
+
+  addMetrics(...metricNames: string[]): QueryBuilder {
+    const merged = Array.from(new Set([...this.spec.metrics, ...metricNames]));
+    return this.withSpec({ metrics: merged });
+  }
+
+  where(filter: FilterContext): QueryBuilder {
+    const mergedFilter = mergeFilters(this.spec.filters, filter);
+    return this.withSpec({ filters: mergedFilter });
+  }
+
+  build(): QuerySpec {
+    return { ...this.spec };
+  }
+
+  run(): Row[] {
+    return this.engine.run(this.build());
+  }
+}
+
+class EngineImpl implements Engine {
+  public readonly model: SemanticModel;
+  private env: MetricEvaluationEnvironment;
+
+  constructor(db: InMemoryDb, model: SemanticModel) {
+    this.model = model;
+    this.env = { db, model };
+  }
+
+  query(table: string): QueryBuilder {
+    return new EngineQueryBuilder(this, {
+      table,
+      attributes: [],
+      metrics: [],
+    });
+  }
+
+  run(spec: QuerySpec): Row[] {
+    return executeQuery(this.env, spec);
+  }
+
+  evaluateMetric(name: string, ctx: MetricContext = {}): number | null {
+    return evaluateMetric(name, this.env, ctx);
+  }
+
+  listMetrics(): MetricDefinition[] {
+    return Object.values(this.model.metrics);
+  }
+
+  getMetric(name: string): MetricDefinition | undefined {
+    return this.model.metrics[name];
+  }
+}
+
+export function createEngine(db: InMemoryDb, model: SemanticModel): Engine {
+  return new EngineImpl(db, model);
+}
+
+function executeQuery(
+  env: MetricEvaluationEnvironment,
+  spec: QuerySpec
 ): Row[] {
-  const { rows: rowDims, filters = {}, metrics, tableForRows } = options;
+  const tableDef = env.model.tables[spec.table];
+  if (!tableDef) throw new Error(`Unknown table: ${spec.table}`);
 
-  const tableDef = tableDefinitions[tableForRows];
-  if (!tableDef) throw new Error(`Unknown table: ${tableForRows}`);
+  const tableRows = env.db.tables[spec.table];
+  if (!tableRows) throw new Error(`Missing rows for table: ${spec.table}`);
 
-  const tableRows = db.tables[tableForRows];
-  if (!tableRows) throw new Error(`Missing rows for table: ${tableForRows}`);
-
-  const filtered = applyContextToTable(tableRows, filters, tableDef.grain);
-
-  const groups = filtered
-    .groupBy((r: Row) => JSON.stringify(pick(r, rowDims)))
-    .toArray();
-
+  const filtered = applyContextToTable(tableRows, spec.filters, tableDef.grain);
+  const groupKeyFn = spec.attributes.length
+    ? (r: Row) => JSON.stringify(pick(r, spec.attributes))
+    : () => "{}";
+  const groups = filtered.groupBy(groupKeyFn).toArray();
   const cache = new Map<string, number | null>();
   const result: Row[] = [];
 
   for (const g of groups) {
     const keyObj: Row = JSON.parse(g.key());
-    const rowContext: FilterContext = {
-      ...filters,
-      ...keyObj,
-    };
-
+    const dimensionFilters = spec.attributes
+      .map((attr) =>
+        keyObj[attr] === undefined ? undefined : f.eq(attr, keyObj[attr])
+      )
+      .filter((node): node is FilterExpression => Boolean(node));
+    const dimFilterNode: FilterContext = dimensionFilters.length
+      ? dimensionFilters.length === 1
+        ? dimensionFilters[0]
+        : f.and(...dimensionFilters)
+      : undefined;
+    const rowFilter = mergeFilters(spec.filters, dimFilterNode);
     const metricValues: Row = {};
-    for (const m of metrics) {
+
+    for (const metricName of spec.metrics) {
       const numericValue = evaluateMetric(
-        m,
-        db,
-        tableDefinitions,
-        metricRegistry,
-        rowContext,
-        transforms,
+        metricName,
+        env,
+        { filter: rowFilter },
         cache
       );
-      const def = metricRegistry[m];
-      metricValues[m] = formatValue(numericValue, def.format);
+      const def = env.model.metrics[metricName];
+      metricValues[metricName] = formatValue(numericValue, def?.format);
     }
 
-    const dimPart = enrichDimensions(keyObj, db, tableDefinitions);
+    const dimPart = enrichDimensions(keyObj, env.db, env.model.tables);
     result.push({
       ...dimPart,
       ...metricValues,
@@ -541,6 +896,10 @@ export function runQuery(
   }
 
   return result;
+}
+
+export function runQuery(env: MetricEvaluationEnvironment, spec: QuerySpec): Row[] {
+  return executeQuery(env, spec);
 }
 
 /* --------------------------------------------------------------------------
@@ -657,179 +1016,177 @@ export const demoTableDefinitions: TableDefinitionRegistry = {
   },
 };
 
-/**
- * Example context transforms (time intelligence).
- */
-export const demoTransforms: ContextTransformsRegistry = {
-  ytd(ctx) {
-    if (ctx.year == null || ctx.month == null) return ctx;
-    return { ...ctx, month: { lte: Number(ctx.month) } };
-  },
-  lastYear(ctx) {
-    if (ctx.year == null) return ctx;
-    return { ...ctx, year: Number(ctx.year) - 1 };
-  },
-  ytdLastYear(ctx) {
-    if (ctx.year == null || ctx.month == null) return ctx;
-    return {
-      ...ctx,
-      year: Number(ctx.year) - 1,
-      month: { lte: Number(ctx.month) },
-    };
-  },
+export const demoAttributes: AttributeRegistry = {
+  year: attr.id({ name: "year", table: "sales", description: "Calendar year" }),
+  month: attr.id({ name: "month", table: "sales", description: "Calendar month" }),
+  regionId: attr.id({ name: "regionId", table: "sales", description: "Region identifier" }),
+  productId: attr.id({ name: "productId", table: "sales", description: "Product identifier" }),
 };
 
-/**
- * Example metric registry implementing factMeasure, expression, derived, contextTransform.
- */
-export const demoMetrics: MetricRegistry = {};
-
-/**
- * Helper to register a context-transform metric into a registry.
- */
-export function addContextTransformMetric(
-  registry: MetricRegistry,
-  def: Omit<ContextTransformMetric, "kind">
-): void {
-  registry[def.name] = {
-    kind: "contextTransform",
-    ...def,
-  };
-}
-
-/**
- * Build demo metrics (you can mirror this pattern in your own project).
- */
-function buildDemoMetrics() {
-  // Simple fact measures
-  demoMetrics.totalSalesAmount = {
-    kind: "factMeasure",
-    name: "totalSalesAmount",
-    description: "Sum of sales amount over the current context.",
+export const demoMeasures: MeasureRegistry = {
+  salesAmount: measure.sum({
+    name: "salesAmount",
     table: "sales",
     column: "amount",
     format: "currency",
-    // grain omitted → defaults to tableDefinitions.sales.grain
-  };
-
-  demoMetrics.totalSalesQuantity = {
-    kind: "factMeasure",
-    name: "totalSalesQuantity",
-    description: "Sum of sales quantity.",
+  }),
+  salesQuantity: measure.sum({
+    name: "salesQuantity",
     table: "sales",
     column: "quantity",
     format: "integer",
-  };
-
-  demoMetrics.totalBudget = {
-    kind: "factMeasure",
-    name: "totalBudget",
-    description: "Total budget at (year, region) grain; ignores product/month filters.",
+  }),
+  budgetAmount: measure.sum({
+    name: "budgetAmount",
     table: "budget",
     column: "budgetAmount",
     format: "currency",
-    // grain omitted → defaults to tableDefinitions.budget.grain
-  };
+  }),
+};
 
-  // Fact measure with coarser metric grain (like MicroStrategy level metric)
-  demoMetrics.salesAmountYearRegion = {
-    kind: "factMeasure",
+/**
+ * Example context transforms (time intelligence).
+ */
+const ytdTransform: ContextTransform = (ctx) => {
+  const year = asNumber(getFilterValue(ctx, "year"));
+  const month = asNumber(getFilterValue(ctx, "month"));
+  if (year == null || month == null) return ctx;
+  return {
+    ...ctx,
+    filter: mergeFilters(
+      omitFilterFields(ctx.filter, "year", "month"),
+      f.eq("year", year),
+      f.lte("month", month)
+    ),
+  };
+};
+
+const lastYearTransform: ContextTransform = (ctx) => {
+  const year = asNumber(getFilterValue(ctx, "year"));
+  if (year == null) return ctx;
+  return {
+    ...ctx,
+    filter: mergeFilters(
+      omitFilterFields(ctx.filter, "year"),
+      f.eq("year", year - 1)
+    ),
+  };
+};
+
+export const demoTransforms: ContextTransformsRegistry = {
+  ytd: ytdTransform,
+  lastYear: lastYearTransform,
+  ytdLastYear: composeTransforms(ytdTransform, lastYearTransform),
+};
+
+export const demoMetrics: MetricRegistry = {
+  totalSalesAmount: simpleMetric({
+    name: "totalSalesAmount",
+    measure: "salesAmount",
+    description: "Sum of sales amount over the current context.",
+    format: "currency",
+  }),
+  totalSalesQuantity: simpleMetric({
+    name: "totalSalesQuantity",
+    measure: "salesQuantity",
+    description: "Sum of sales quantity.",
+    format: "integer",
+  }),
+  totalBudget: simpleMetric({
+    name: "totalBudget",
+    measure: "budgetAmount",
+    description: "Total budget at (year, region) grain.",
+    format: "currency",
+  }),
+  salesAmountYearRegion: simpleMetric({
     name: "salesAmountYearRegion",
+    measure: "salesAmount",
     description: "Sales aggregated at (year, region) level; ignores month and product filters.",
-    table: "sales",
-    column: "amount",
     format: "currency",
     grain: ["year", "regionId"],
-  };
-
-  // Expression metric: price per unit
-  demoMetrics.pricePerUnit = {
-    kind: "expression",
+  }),
+  pricePerUnit: derivedMetric({
     name: "pricePerUnit",
+    deps: ["totalSalesAmount", "totalSalesQuantity"],
     description: "Sales amount / quantity over the current context.",
-    table: "sales",
     format: "currency",
-    expression: (q: RowSequence) => {
-      const amount = q.sum((r: Row) => Number(r.amount ?? 0));
-      const qty = q.sum((r: Row) => Number(r.quantity ?? 0));
-      return qty ? amount / qty : null;
+    combine: ({ totalSalesAmount, totalSalesQuantity }) => {
+      const amount = totalSalesAmount ?? 0;
+      const qty = totalSalesQuantity ?? 0;
+      if (!qty) return null;
+      return amount / qty;
     },
-  };
-
-  // Derived metric: Sales vs Budget %
-  demoMetrics.salesVsBudgetPct = {
-    kind: "derived",
+  }),
+  salesVsBudgetPct: derivedMetric({
     name: "salesVsBudgetPct",
+    deps: ["totalSalesAmount", "totalBudget"],
     description: "Total sales / total budget.",
-    dependencies: ["totalSalesAmount", "totalBudget"],
     format: "percent",
-    evalFromDeps: ({ totalSalesAmount, totalBudget }) => {
+    combine: ({ totalSalesAmount, totalBudget }) => {
       const s = totalSalesAmount ?? 0;
       const b = totalBudget ?? 0;
       if (!b) return null;
       return (s / b) * 100;
     },
-  };
-
-  // Time-int metrics (context-transform)
-  addContextTransformMetric(demoMetrics, {
+  }),
+  salesAmountYTD: contextTransformMetric({
     name: "salesAmountYTD",
-    baseMeasure: "totalSalesAmount",
-    transform: "ytd",
+    baseMetric: "totalSalesAmount",
+    transform: demoTransforms.ytd,
     description: "YTD of total sales amount.",
     format: "currency",
-  });
-
-  addContextTransformMetric(demoMetrics, {
+  }),
+  salesAmountLastYear: contextTransformMetric({
     name: "salesAmountLastYear",
-    baseMeasure: "totalSalesAmount",
-    transform: "lastYear",
+    baseMetric: "totalSalesAmount",
+    transform: demoTransforms.lastYear,
     description: "Total sales amount for previous year.",
     format: "currency",
-  });
-
-  addContextTransformMetric(demoMetrics, {
+  }),
+  salesAmountYTDLastYear: contextTransformMetric({
     name: "salesAmountYTDLastYear",
-    baseMeasure: "totalSalesAmount",
-    transform: "ytdLastYear",
+    baseMetric: "totalSalesAmount",
+    transform: demoTransforms.ytdLastYear,
     description: "YTD of total sales amount in previous year.",
     format: "currency",
-  });
-
-  addContextTransformMetric(demoMetrics, {
+  }),
+  budgetYTD: contextTransformMetric({
     name: "budgetYTD",
-    baseMeasure: "totalBudget",
-    transform: "ytd",
-    description: "YTD of total budget (may match full year if budget is annual).",
+    baseMetric: "totalBudget",
+    transform: demoTransforms.ytd,
+    description: "YTD of total budget.",
     format: "currency",
-  });
-
-  addContextTransformMetric(demoMetrics, {
+  }),
+  budgetLastYear: contextTransformMetric({
     name: "budgetLastYear",
-    baseMeasure: "totalBudget",
-    transform: "lastYear",
+    baseMetric: "totalBudget",
+    transform: demoTransforms.lastYear,
     description: "Total budget in previous year.",
     format: "currency",
-  });
-
-  // Derived YTD comparison metric
-  demoMetrics.salesVsBudgetPctYTD = {
-    kind: "derived",
+  }),
+  salesVsBudgetPctYTD: derivedMetric({
     name: "salesVsBudgetPctYTD",
+    deps: ["salesAmountYTD", "budgetYTD"],
     description: "YTD sales / YTD budget.",
-    dependencies: ["salesAmountYTD", "budgetYTD"],
     format: "percent",
-    evalFromDeps: ({ salesAmountYTD, budgetYTD }) => {
+    combine: ({ salesAmountYTD, budgetYTD }) => {
       const s = salesAmountYTD ?? 0;
       const b = budgetYTD ?? 0;
       if (!b) return null;
       return (s / b) * 100;
     },
-  };
-}
+  }),
+};
 
-// Build demo metrics immediately
-buildDemoMetrics();
+export const demoModel: SemanticModel = {
+  tables: demoTableDefinitions,
+  attributes: demoAttributes,
+  measures: demoMeasures,
+  metrics: demoMetrics,
+  transforms: demoTransforms,
+};
+
+export const demoEngine = createEngine(demoDb, demoModel);
 
 /**
  * DEMO USAGE
@@ -841,6 +1198,7 @@ buildDemoMetrics();
  */
 
 if (typeof require !== "undefined" && typeof module !== "undefined" && require.main === module) {
+  const engine = demoEngine;
   const metricBundle = [
     "totalSalesAmount",
     "totalSalesQuantity",
@@ -856,51 +1214,32 @@ if (typeof require !== "undefined" && typeof module !== "undefined" && require.m
     "salesVsBudgetPctYTD",
   ];
 
+  const base2025 = engine.query("sales").where({ year: 2025 });
+
   console.log("\n=== Demo: 2025-02, Region x Product ===");
-  const result1 = runQuery(
-    demoDb,
-    demoTableDefinitions,
-    demoMetrics,
-    demoTransforms,
-    {
-      rows: ["regionId", "productId"],
-      filters: { year: 2025, month: 2 },
-      metrics: metricBundle,
-      tableForRows: "sales",
-    }
-  );
+  const result1 = base2025
+    .addAttributes("regionId", "productId")
+    .addMetrics(...metricBundle)
+    .where({ month: 2 })
+    .run();
   // eslint-disable-next-line no-console
   console.table(result1);
 
   console.log("\n=== Demo: 2025-02, Region only ===");
-  const result2 = runQuery(
-    demoDb,
-    demoTableDefinitions,
-    demoMetrics,
-    demoTransforms,
-    {
-      rows: ["regionId"],
-      filters: { year: 2025, month: 2 },
-      metrics: metricBundle,
-      tableForRows: "sales",
-    }
-  );
+  const result2 = base2025
+    .addAttributes("regionId")
+    .addMetrics(...metricBundle)
+    .where({ month: 2 })
+    .run();
   // eslint-disable-next-line no-console
   console.table(result2);
 
   console.log("\n=== Demo: 2025-02, Region=NA, by Product ===");
-  const result3 = runQuery(
-    demoDb,
-    demoTableDefinitions,
-    demoMetrics,
-    demoTransforms,
-    {
-      rows: ["productId"],
-      filters: { year: 2025, month: 2, regionId: "NA" },
-      metrics: metricBundle,
-      tableForRows: "sales",
-    }
-  );
+  const result3 = base2025
+    .addAttributes("productId")
+    .addMetrics(...metricBundle)
+    .where({ month: 2, regionId: "NA" })
+    .run();
   // eslint-disable-next-line no-console
   console.table(result3);
 }

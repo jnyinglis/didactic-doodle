@@ -1,24 +1,17 @@
 import { expect } from "chai";
 import {
   applyContextToTable,
+  createEngine,
   demoDb,
-  demoMetrics,
+  demoModel,
   demoTableDefinitions,
-  demoTransforms,
-  evaluateMetric,
-  runQuery,
   FilterContext,
 } from "../src/semanticEngine";
 
+const engine = createEngine(demoDb, demoModel);
+
 function evaluate(name: string, context: FilterContext) {
-  return evaluateMetric(
-    name,
-    demoDb,
-    demoTableDefinitions,
-    demoMetrics,
-    context,
-    demoTransforms
-  );
+  return engine.evaluateMetric(name, { filter: context });
 }
 
 describe("semanticEngine", () => {
@@ -73,18 +66,12 @@ describe("semanticEngine", () => {
 
   describe("runQuery", () => {
     it("returns formatted metric values and enriches dimension labels", () => {
-      const rows = runQuery(
-        demoDb,
-        demoTableDefinitions,
-        demoMetrics,
-        demoTransforms,
-        {
-          rows: ["regionId"],
-          filters: { year: 2025, month: 2 },
-          metrics: ["totalSalesAmount"],
-          tableForRows: "sales",
-        }
-      );
+      const rows = engine
+        .query("sales")
+        .addAttributes("regionId")
+        .addMetrics("totalSalesAmount")
+        .where({ year: 2025, month: 2 })
+        .run();
 
       expect(rows).to.deep.include({
         regionId: "NA",
@@ -96,6 +83,23 @@ describe("semanticEngine", () => {
         regionName: "Europe",
         totalSalesAmount: "$450.00",
       });
+    });
+
+    it("allows base builders to be reused for different slices", () => {
+      const base = engine.query("sales").where({ year: 2025 });
+      const a = base
+        .addAttributes("regionId")
+        .addMetrics("totalSalesAmount")
+        .where({ month: 2 })
+        .run();
+      const b = engine
+        .query("sales")
+        .where({ year: 2025 })
+        .addAttributes("regionId")
+        .addMetrics("totalSalesAmount")
+        .where({ month: 2 })
+        .run();
+      expect(a).to.deep.equal(b);
     });
   });
 });
