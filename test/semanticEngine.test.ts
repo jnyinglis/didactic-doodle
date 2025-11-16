@@ -6,6 +6,7 @@ import {
   demoModel,
   demoTableDefinitions,
   FilterContext,
+  Row,
 } from "../src/semanticEngine";
 
 const engine = createEngine(demoDb, demoModel);
@@ -15,6 +16,71 @@ function evaluate(name: string, context: FilterContext) {
 }
 
 describe("semanticEngine", () => {
+  describe("FilterRange tagged union", () => {
+    const salesRows: Row[] = demoDb.tables.sales;
+    const grain = demoTableDefinitions.sales.grain;
+
+    it("supports every range variant", () => {
+      const between = applyContextToTable(
+        salesRows,
+        { month: { kind: "between", from: 1, to: 1 } },
+        grain
+      ).toArray();
+      const betweenPredicate = (row: Row) =>
+        row.month >= 1 && row.month <= 1;
+      expect(between.every(betweenPredicate)).to.be.true;
+      expect(between).to.have.lengthOf(
+        salesRows.filter(betweenPredicate).length
+      );
+
+      const gte = applyContextToTable(
+        salesRows,
+        { month: { kind: "gte", value: 2 } },
+        grain
+      ).toArray();
+      const gtePredicate = (row: Row) => row.month >= 2;
+      expect(gte.every(gtePredicate)).to.be.true;
+      expect(gte).to.have.lengthOf(salesRows.filter(gtePredicate).length);
+
+      const gt = applyContextToTable(
+        salesRows,
+        { month: { kind: "gt", value: 1 } },
+        grain
+      ).toArray();
+      const gtPredicate = (row: Row) => row.month > 1;
+      expect(gt.every(gtPredicate)).to.be.true;
+      expect(gt).to.have.lengthOf(salesRows.filter(gtPredicate).length);
+
+      const lte = applyContextToTable(
+        salesRows,
+        { month: { kind: "lte", value: 1 } },
+        grain
+      ).toArray();
+      const ltePredicate = (row: Row) => row.month <= 1;
+      expect(lte.every(ltePredicate)).to.be.true;
+      expect(lte).to.have.lengthOf(salesRows.filter(ltePredicate).length);
+
+      const lt = applyContextToTable(
+        salesRows,
+        { month: { kind: "lt", value: 2 } },
+        grain
+      ).toArray();
+      const ltPredicate = (row: Row) => row.month < 2;
+      expect(lt.every(ltPredicate)).to.be.true;
+      expect(lt).to.have.lengthOf(salesRows.filter(ltPredicate).length);
+    });
+
+    it("rejects ambiguous range payloads", () => {
+      expect(() =>
+        applyContextToTable(
+          salesRows,
+          { amount: { from: 400, to: 900 } as any },
+          grain
+        )
+      ).to.throw(/Invalid filter range/);
+    });
+  });
+
   describe("applyContextToTable", () => {
     it("ignores filters that are not part of the grain", () => {
       const ctx: FilterContext = { year: 2025, regionId: "NA", productId: 1 };
@@ -61,6 +127,19 @@ describe("semanticEngine", () => {
         month: 2,
       });
       expect(value).to.be.closeTo((950 / 2200) * 100, 0.0001);
+    });
+
+    it("allows multiple metrics to reuse the same measure with different aggregations", () => {
+      const total = evaluate("totalBudget", { year: 2025 });
+      const average = evaluate("averageBudgetAmount", { year: 2025 });
+
+      expect(total).to.equal(3800);
+      expect(average).to.equal(1900);
+    });
+
+    it("lets custom metrics request aggregations at runtime", () => {
+      const value = evaluate("budgetRange", { year: 2025 });
+      expect(value).to.equal(2200 - 1600);
     });
   });
 

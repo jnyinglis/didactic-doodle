@@ -23,14 +23,12 @@ export type RowSequence = ReturnType<typeof rowsToEnumerable>;
  * - range/comparison for numeric-like fields (month <= 6, etc.)
  */
 export type FilterPrimitive = string | number | boolean | Date;
-export interface FilterRange {
-  from?: number;
-  to?: number;
-  gte?: number;
-  lte?: number;
-  gt?: number;
-  lt?: number;
-}
+export type FilterRange =
+  | { kind: "between"; from: number; to: number }
+  | { kind: "gte"; value: number }
+  | { kind: "gt"; value: number }
+  | { kind: "lte"; value: number }
+  | { kind: "lt"; value: number };
 export type FilterValue = FilterPrimitive | FilterRange | FilterPrimitive[];
 
 export type ScalarOp = "eq" | "lt" | "lte" | "gt" | "gte" | "between" | "in";
@@ -101,6 +99,37 @@ function normalizeFilterContext(ctx: FilterContext): FilterNode | undefined {
   return f.and(...filters);
 }
 
+type FilterRangeInput =
+  | { kind: "between"; from: number; to: number }
+  | { kind: "gte" | "gt" | "lte" | "lt"; value: number };
+
+function isFilterRange(value: any): value is FilterRangeInput {
+  if (!value || typeof value !== "object") return false;
+  switch (value.kind) {
+    case "between":
+      return value.from != null && value.to != null;
+    case "gte":
+    case "gt":
+    case "lte":
+    case "lt":
+      return value.value != null;
+    default:
+      return false;
+  }
+}
+
+function ensureNumericRangeValue(
+  raw: number,
+  field: string,
+  kind: string
+): number {
+  const coerced = Number(raw);
+  if (Number.isNaN(coerced)) {
+    throw new Error(`Invalid numeric filter for field "${field}" (${kind}).`);
+  }
+  return coerced;
+}
+
 function convertFilterValueToExpression(
   field: string,
   value: FilterValue
@@ -109,30 +138,45 @@ function convertFilterValueToExpression(
   if (Array.isArray(value)) {
     return f.in(field, value);
   }
+  if (value instanceof Date) {
+    return f.eq(field, value);
+  }
   if (typeof value === "object") {
-    const range = value as FilterRange;
-    if (range.from != null && range.to != null) {
-      return f.between(field, Number(range.from), Number(range.to));
+    if (!isFilterRange(value)) {
+      throw new Error(
+        `Invalid filter range for field "${field}": expected a tagged union.`
+      );
     }
-    if (range.gte != null) {
-      return f.gte(field, Number(range.gte));
+    switch (value.kind) {
+      case "between":
+        return f.between(
+          field,
+          ensureNumericRangeValue(value.from, field, value.kind),
+          ensureNumericRangeValue(value.to, field, value.kind)
+        );
+      case "gte":
+        return f.gte(
+          field,
+          ensureNumericRangeValue(value.value, field, value.kind)
+        );
+      case "gt":
+        return f.gt(
+          field,
+          ensureNumericRangeValue(value.value, field, value.kind)
+        );
+      case "lte":
+        return f.lte(
+          field,
+          ensureNumericRangeValue(value.value, field, value.kind)
+        );
+      case "lt":
+        return f.lt(
+          field,
+          ensureNumericRangeValue(value.value, field, value.kind)
+        );
+      default:
+        return undefined;
     }
-    if (range.lte != null) {
-      return f.lte(field, Number(range.lte));
-    }
-    if (range.gt != null) {
-      return f.gt(field, Number(range.gt));
-    }
-    if (range.lt != null) {
-      return f.lt(field, Number(range.lt));
-    }
-    if (range.from != null) {
-      return f.gte(field, Number(range.from));
-    }
-    if (range.to != null) {
-      return f.lte(field, Number(range.to));
-    }
-    return undefined;
   }
   return f.eq(field, value);
 }
@@ -163,10 +207,12 @@ export interface InMemoryDb {
   tables: Record<string, Row[]>;
 }
 
+export type AggregationOperator = "sum" | "avg" | "count" | "min" | "max";
+
 export interface TableColumn {
   role: "attribute" | "measure";
   dataType?: "string" | "number" | "date";
-  defaultAgg?: "sum" | "avg" | "count" | "min" | "max";
+  defaultAgg?: AggregationOperator;
   format?: string;
   labelFor?: string;
   labelAlias?: string;
@@ -194,7 +240,6 @@ export interface MeasureDefinition {
   name: string;
   table: string;
   column?: string;
-  aggregation?: "sum" | "avg" | "count" | "min" | "max";
   format?: string;
   description?: string;
   grain?: string[];
@@ -212,17 +257,10 @@ export const attr = {
 };
 
 export const measure = {
-  sum(opts: MeasureDefinition): MeasureDefinition {
+  fact(opts: MeasureDefinition): MeasureDefinition {
     return {
       ...opts,
       column: opts.column ?? opts.name,
-      aggregation: opts.aggregation ?? "sum",
-    };
-  },
-  count(opts: MeasureDefinition): MeasureDefinition {
-    return {
-      ...opts,
-      aggregation: "count",
     };
   },
 };
@@ -244,6 +282,7 @@ interface MetricBase {
   description?: string;
   format?: string;
   grain?: string[];
+  aggregation?: AggregationOperator;
 }
 
 export interface MetricContext {
@@ -273,19 +312,25 @@ export function composeTransforms(
     transforms.reduce((acc, transform) => transform(acc), ctx);
 }
 
-export function simpleMetric(opts: {
+interface SimpleMetricOptions {
   name: string;
   measure: string;
+  aggregation?: AggregationOperator;
   description?: string;
   format?: string;
   grain?: string[];
-}): MetricDefinition {
+}
+
+export function simpleMetric(opts: SimpleMetricOptions): MetricDefinition {
+  const aggregation = opts.aggregation ?? "sum";
   return {
     name: opts.name,
     description: opts.description,
     format: opts.format,
     grain: opts.grain,
-    eval: (ctx, runtime) => runtime.evaluateMeasure(opts.measure, ctx),
+    aggregation,
+    eval: (ctx, runtime) =>
+      runtime.evaluateMeasure(opts.measure, ctx, { aggregation }),
   };
 }
 
@@ -336,7 +381,11 @@ interface MetricEvaluationEnvironment {
 
 export interface MetricRuntime {
   evaluate(metricName: string, ctx: MetricContext): number | null;
-  evaluateMeasure(measureName: string, ctx: MetricContext): number | null;
+  evaluateMeasure(
+    measureName: string,
+    ctx: MetricContext,
+    options?: MeasureEvaluationOptions
+  ): number | null;
   env: MetricEvaluationEnvironment;
 }
 
@@ -442,15 +491,19 @@ function expressionToFilterValue(
     case "eq":
       return expr.value;
     case "between":
-      return { from: expr.value, to: expr.value2 };
+      return {
+        kind: "between",
+        from: Number(expr.value),
+        to: Number(expr.value2),
+      };
     case "lt":
-      return { lt: expr.value };
+      return { kind: "lt", value: Number(expr.value) };
     case "lte":
-      return { lte: expr.value };
+      return { kind: "lte", value: Number(expr.value) };
     case "gt":
-      return { gt: expr.value };
+      return { kind: "gt", value: Number(expr.value) };
     case "gte":
-      return { gte: expr.value };
+      return { kind: "gte", value: Number(expr.value) };
     case "in":
       return Array.isArray(expr.value) ? expr.value : [expr.value];
     default:
@@ -531,10 +584,15 @@ function mergeMetricContexts(
   };
 }
 
+export interface MeasureEvaluationOptions {
+  aggregation?: AggregationOperator;
+}
+
 function evaluateMeasureDefinition(
   measureName: string,
   ctx: MetricContext,
-  env: MetricEvaluationEnvironment
+  env: MetricEvaluationEnvironment,
+  options?: MeasureEvaluationOptions
 ): number | null {
   const def = env.model.measures[measureName];
   if (!def) {
@@ -552,8 +610,10 @@ function evaluateMeasureDefinition(
   const grain = ctx.grain ?? def.grain ?? tableDef.grain;
   const filtered = applyContextToTable(rows, ctx.filter, grain);
 
-  const aggregation = def.aggregation ?? "sum";
   const column = def.column ?? def.name;
+  const columnDef = tableDef.columns[column];
+  const aggregation =
+    options?.aggregation ?? columnDef?.defaultAgg ?? "sum";
   const pickValue = (row: Row): number | null => {
     const raw = Number(row[column]);
     return Number.isNaN(raw) ? null : raw;
@@ -719,11 +779,16 @@ export function evaluateMetric(
         mergeMetricContexts(effectiveContext, ctx),
         cache
       ),
-    evaluateMeasure: (measureName: string, ctx: MetricContext = {}) =>
+    evaluateMeasure: (
+      measureName: string,
+      ctx: MetricContext = {},
+      options?: MeasureEvaluationOptions
+    ) =>
       evaluateMeasureDefinition(
         measureName,
         mergeMetricContexts(effectiveContext, ctx),
-        env
+        env,
+        options
       ),
   };
 
@@ -1024,19 +1089,19 @@ export const demoAttributes: AttributeRegistry = {
 };
 
 export const demoMeasures: MeasureRegistry = {
-  salesAmount: measure.sum({
+  salesAmount: measure.fact({
     name: "salesAmount",
     table: "sales",
     column: "amount",
     format: "currency",
   }),
-  salesQuantity: measure.sum({
+  salesQuantity: measure.fact({
     name: "salesQuantity",
     table: "sales",
     column: "quantity",
     format: "integer",
   }),
-  budgetAmount: measure.sum({
+  budgetAmount: measure.fact({
     name: "budgetAmount",
     table: "budget",
     column: "budgetAmount",
@@ -1085,18 +1150,28 @@ export const demoMetrics: MetricRegistry = {
     measure: "salesAmount",
     description: "Sum of sales amount over the current context.",
     format: "currency",
+    aggregation: "sum",
   }),
   totalSalesQuantity: simpleMetric({
     name: "totalSalesQuantity",
     measure: "salesQuantity",
     description: "Sum of sales quantity.",
     format: "integer",
+    aggregation: "sum",
   }),
   totalBudget: simpleMetric({
     name: "totalBudget",
     measure: "budgetAmount",
     description: "Total budget at (year, region) grain.",
     format: "currency",
+    aggregation: "sum",
+  }),
+  averageBudgetAmount: simpleMetric({
+    name: "averageBudgetAmount",
+    measure: "budgetAmount",
+    description: "Average budget across the filtered regions.",
+    format: "currency",
+    aggregation: "avg",
   }),
   salesAmountYearRegion: simpleMetric({
     name: "salesAmountYearRegion",
@@ -1104,6 +1179,7 @@ export const demoMetrics: MetricRegistry = {
     description: "Sales aggregated at (year, region) level; ignores month and product filters.",
     format: "currency",
     grain: ["year", "regionId"],
+    aggregation: "sum",
   }),
   pricePerUnit: derivedMetric({
     name: "pricePerUnit",
@@ -1129,6 +1205,21 @@ export const demoMetrics: MetricRegistry = {
       return (s / b) * 100;
     },
   }),
+  budgetRange: {
+    name: "budgetRange",
+    description: "Difference between the max and min budget values.",
+    format: "currency",
+    eval: (ctx, runtime) => {
+      const max = runtime.evaluateMeasure("budgetAmount", ctx, {
+        aggregation: "max",
+      });
+      const min = runtime.evaluateMeasure("budgetAmount", ctx, {
+        aggregation: "min",
+      });
+      if (max == null || min == null) return null;
+      return max - min;
+    },
+  },
   salesAmountYTD: contextTransformMetric({
     name: "salesAmountYTD",
     baseMetric: "totalSalesAmount",
