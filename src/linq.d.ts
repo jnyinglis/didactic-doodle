@@ -1,3 +1,5 @@
+export as namespace Enumerable;
+
 declare namespace Enumerable {
   export let Utils: {
     createLambda(expression: null): (x: unknown) => unknown;
@@ -252,4 +254,5 @@ declare namespace Enumerable {
   }
 }
 
-export default Enumerable;
+declare const EnumerableJS: typeof Enumerable;
+export default EnumerableJS;
