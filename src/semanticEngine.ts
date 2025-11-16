@@ -11,11 +11,11 @@ import Enumerable from "./linq";
  */
 export type Row = Record<string, any>;
 
-export type RowSequence = Enumerable.IEnumerable<Row>;
-
-export function rowsToEnumerable(rows: Row[] = []): RowSequence {
+export function rowsToEnumerable(rows: Row[] = []) {
   return Enumerable.from(rows ?? []);
 }
+
+export type RowSequence = ReturnType<typeof rowsToEnumerable>;
 
 /**
  * Filter context types:
@@ -384,7 +384,7 @@ export function evaluateMetric(
       case "min": {
         const values = sequence
           .select((r: Row) => pickValue(r))
-          .where((num): num is number => typeof num === "number")
+          .where((num: number | null): num is number => typeof num === "number")
           .toArray();
         value = values.length === 0 ? null : Math.min(...values);
         break;
@@ -392,7 +392,7 @@ export function evaluateMetric(
       case "max": {
         const values = sequence
           .select((r: Row) => pickValue(r))
-          .where((num): num is number => typeof num === "number")
+          .where((num: number | null): num is number => typeof num === "number")
           .toArray();
         value = values.length === 0 ? null : Math.max(...values);
         break;
