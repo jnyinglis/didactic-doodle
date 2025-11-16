@@ -1,29 +1,28 @@
 # Semantic Metrics Engine POC
 
-This repository hosts a TypeScript proof-of-concept for a semantic metrics engine inspired by MicroStrategy, MetricFlow, and other semantic layers. The core engine lives in [`src/semanticEngine.ts`](src/semanticEngine.ts) and exposes a declarative way to model tables, metrics, and time-aware context transforms before materializing formatted result sets.
+This repository contains a TypeScript proof-of-concept for a semantic metrics engine inspired by tools such as MicroStrategy, MetricFlow, and other semantic layers. The project demonstrates how to:
 
-## Key capabilities
+- Declare **table metadata** (grain, relationships, formatting hints) alongside the in-memory data they describe.
+- Register **attributes, measures, and metrics** with consistent naming and documentation.
+- Express **filter contexts** using a small DSL (`f.eq`, `f.and`, range helpers, etc.) that can be merged, normalized, and reused across queries.
+- Compose **metric types**—fact measures, arbitrary expressions, derived metrics, and context transforms (YTD, prior year, YTD last year).
+- Run **LINQ-style queries** over in-memory rows (via the bundled [`linq.js`](src/linq.js)) to return formatted, label-enriched result sets.
 
-- **Unified table metadata** – All physical data lives in an in-memory [`InMemoryDb`](src/semanticEngine.ts) and is described through `TableDefinition` objects. Columns capture their role (attribute/measure), data type, default aggregation, and optional label relationships so lookup captions (e.g., `regionName`) are enriched automatically.
-- **Metric registry** – Define metrics once and re-use them everywhere. The engine ships with four metric types: `factMeasure`, `expression`, `derived`, and `contextTransform` for time intelligence scenarios.
-- **Filter contexts & transforms** – Any metric can be evaluated under a filter context (`year`, `regionId`, etc.). Context-transform metrics (YTD, last year, YTD last year, and more) mutate those filters on the fly before deferring to the underlying base metric.
-- **LINQ-style execution** – Row operations use the bundled [`linq.js`](src/linq.js) implementation and the helper [`rowsToEnumerable`](src/semanticEngine.ts) so queries, metrics, and transforms can fluently compose `Enumerable` operators (`where`, `groupBy`, `sum`, `select`, …).
-- **Formatted query results** – `runQuery` builds dimensioned result sets, applies metric formatting hints (currency, integer, percent), and injects label columns for human-friendly tables or chart inputs.
-- **Documented operators** – [`src/operators.md`](src/operators.md) is a quick-start for every LINQ helper provided by the bundled library, making it easy to author richer metrics.
+Everything lives in [`src/semanticEngine.ts`](src/semanticEngine.ts), including the demo data/model, query builder, and CLI showcase guarded by `require.main === module`.
 
 ## Repository layout
 
 | Path | Description |
 | --- | --- |
-| `src/semanticEngine.ts` | Engine implementation plus demo data, metric registry, context transforms, and a CLI demo. |
-| `src/linq.js` / `src/linq.d.ts` | Bundled LINQ implementation and accompanying TypeScript declarations used by the engine. |
-| `src/operators.md` | Reference for every LINQ operator available when writing metrics or transforms. |
-| `test/semanticEngine.test.ts` | Mocha/Chai suite covering context application, metric evaluation, time intelligence, and `runQuery` formatting. |
-| `SPEC.md` | Design notes that describe the refactor toward LINQ-first execution and unified table metadata. |
+| [`src/semanticEngine.ts`](src/semanticEngine.ts) | Engine implementation, builders (`attr`, `measure`, `metric`, `contextTransform`), query execution, demo data/model, and CLI demo. |
+| [`src/linq.js`](src/linq.js) / [`src/linq.d.ts`](src/linq.d.ts) | Bundled LINQ implementation plus TypeScript definitions that power `rowsToEnumerable` and query execution. |
+| [`src/operators.md`](src/operators.md) | Quick reference of every available LINQ helper for authoring custom metrics or transforms. |
+| [`test/semanticEngine.test.ts`](test/semanticEngine.test.ts) | Mocha + Chai suite covering context filtering, metric evaluation, and formatted query output. |
+| [`SPEC.md`](SPEC.md) | Design notes outlining the motivation behind the refactor to a LINQ-first execution model. |
 
 ## Getting started
 
-1. **Install dependencies** (for TypeScript + testing):
+1. **Install dependencies** (TypeScript toolchain + Mocha/Chai):
    ```bash
    npm install
    ```
@@ -31,54 +30,52 @@ This repository hosts a TypeScript proof-of-concept for a semantic metrics engin
    ```bash
    npm test
    ```
-   The suite executes directly against the demo data/metrics to validate the public helpers (`applyContextToTable`, `evaluateMetric`, and `runQuery`).
-3. **Try the demo script** – Because `src/semanticEngine.ts` includes a `require.main === module` guard, you can run the sample queries via `ts-node`:
+   The suite executes directly against the demo database to validate `applyContextToTable`, metric evaluation (including transforms), and the query builder.
+3. **Try the CLI demo** (optional):
    ```bash
    npx ts-node src/semanticEngine.ts
    ```
-   The script prints several dimensioned result sets for 2025 sales, showcasing filters, different row grains, and metric formatting.
+   The script prints several queries for 2025 sales, showcasing dimension grains, reused builders, metric formatting, and the built-in time-intelligence transforms.
 
-## Usage example
+## Using the engine
 
 ```ts
 import {
-  runQuery,
+  createEngine,
   demoDb,
-  demoTableDefinitions,
-  demoMetrics,
-  demoTransforms,
+  demoModel,
 } from "./src/semanticEngine";
 
-const rows = runQuery(
-  demoDb,
-  demoTableDefinitions,
-  demoMetrics,
-  demoTransforms,
-  {
-    rows: ["regionId", "productId"],
-    filters: { year: 2025, month: 2 },
-    metrics: ["totalSalesAmount", "salesAmountYTD", "salesVsBudgetPct"],
-    tableForRows: "sales",
-  }
-);
+const engine = createEngine(demoDb, demoModel);
+
+const rows = engine
+  .query("sales")
+  .where({ year: 2025, month: 2 })
+  .addAttributes("regionId", "productId")
+  .addMetrics("totalSalesAmount", "salesAmountYTD", "salesVsBudgetPct")
+  .run();
 
 console.table(rows);
 ```
 
-The engine will:
-1. Filter the `sales` table to the requested context and respect metric-level grain overrides (e.g., metrics defined at `year + regionId`).
-2. Evaluate each metric through its registered definition and cache repeated calls inside the query loop.
-3. Format numeric results (currency, integer, percent, etc.) and enrich attributes with their label columns (`regionName`, `productName`).
+Under the hood the engine will:
 
-## Extending the engine
+1. Apply the provided filter context, respecting the table grain and any metric-level overrides (e.g., `salesAmountYearRegion`).
+2. Evaluate each metric via the registry, caching repeated calculations and running dependency chains for derived metrics.
+3. Format values (currency, integer, percent, etc.) and enrich attributes with their label columns (`regionName`, `productName`).
 
-1. **Model your tables** – Populate `db.tables` with raw rows and describe each dataset inside `tableDefinitions`. Use the `labelFor` metadata whenever a lookup caption should accompany a key.
-2. **Register metrics** – Add entries to a `MetricRegistry` using the type that matches your needs:
-   - `factMeasure` for direct aggregations over a column.
-   - `expression` for custom LINQ aggregations.
-   - `derived` when a metric depends on other metrics.
-   - `contextTransform` to wrap a base metric with reusable filter mutations (YTD, prior year, rolling windows, etc.).
-3. **Add context transforms** – Implement functions that accept a `FilterContext` and return a new one (see `demoTransforms` for YTD, last year, and YTD last year examples).
-4. **Query the data** – Call `runQuery` with the row dimensions, filters, metric IDs, and the table that determines the row grain. The returned rows are ready for tables, charts, or API responses.
+You can also call `engine.evaluateMetric("salesAmountYTD", { filter: { year: 2025, month: 2 } })` for ad-hoc metric checks, or reuse partially-built queries (`const base = engine.query("sales").where({ year: 2025 });`) to reduce boilerplate across slices.
 
-Because the engine is entirely in-memory and powered by fluent `Enumerable` operators, it is straightforward to experiment with additional scenarios such as new time-intelligence patterns, richer label joins, or future SQL push-down prototypes.
+## Extending the POC
+
+1. **Model your tables** by inserting raw rows into `db.tables` and describing them inside a `TableDefinitionRegistry` (grain, column roles, label relationships, formats).
+2. **Declare attributes and measures** using the helper builders exported from `src/semanticEngine.ts`. This keeps documentation, column mappings, and default aggregations centralized.
+3. **Register metrics** in a `MetricRegistry` using:
+   - `simpleMetric` (fact measures)
+   - `expressionMetric` (custom LINQ aggregates)
+   - `derivedMetric` (metric arithmetic / dependency graphs)
+   - `contextTransformMetric` (time-intelligence / scenario filters)
+4. **Add context transforms** that accept and return `MetricContext` objects. The demo includes `ytd`, `lastYear`, and `ytdLastYear`, and they can be composed via `composeTransforms`.
+5. **Query the data** through `engine.query(table)` to configure attributes, metrics, and filters, or call `runQuery` directly if you prefer to build `QuerySpec` objects yourself.
+
+Because everything is in-memory, the POC is a convenient playground for experimenting with new metric types, richer labeling strategies, or eventually swapping the execution layer for SQL push-down.
