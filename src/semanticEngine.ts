@@ -290,6 +290,20 @@ export interface MetricContext {
   grain?: string[];
 }
 
+export interface TransformHelpers {
+  env: MetricEvaluationEnvironment;
+
+  // Data access
+  rows(tableName: string): RowSequence;
+  first(tableName: string, predicate: (r: Row) => boolean): Row | undefined;
+  filterRows(tableName: string, predicate: (r: Row) => boolean): RowSequence;
+
+  // Context helpers
+  getFilterValue(field: string, ctx: MetricContext): FilterValue | undefined;
+  mergeFilters: typeof mergeFilters;
+  f: typeof f;
+}
+
 export type MetricEval = (
   ctx: MetricContext,
   runtime: MetricRuntime
@@ -302,14 +316,17 @@ export interface MetricDefinition extends MetricBase {
 
 export type MetricRegistry = Record<string, MetricDefinition>;
 
-export type ContextTransform = (ctx: MetricContext) => MetricContext;
+export type ContextTransform = (
+  ctx: MetricContext,
+  helpers: TransformHelpers
+) => MetricContext;
 export type ContextTransformsRegistry = Record<string, ContextTransform>;
 
 export function composeTransforms(
   ...transforms: ContextTransform[]
 ): ContextTransform {
-  return (ctx: MetricContext) =>
-    transforms.reduce((acc, transform) => transform(acc), ctx);
+  return (ctx: MetricContext, helpers: TransformHelpers) =>
+    transforms.reduce((acc, transform) => transform(acc, helpers), ctx);
 }
 
 interface SimpleMetricOptions {
@@ -370,7 +387,11 @@ export function contextTransformMetric(opts: {
     description: opts.description,
     format: opts.format,
     deps: [opts.baseMetric],
-    eval: (ctx, runtime) => runtime.evaluate(opts.baseMetric, opts.transform(ctx)),
+    eval: (ctx, runtime) => {
+      const helpers = buildTransformHelpers(runtime.env);
+      const transformedCtx = opts.transform(ctx, helpers);
+      return runtime.evaluate(opts.baseMetric, transformedCtx);
+    },
   };
 }
 
@@ -387,6 +408,35 @@ export interface MetricRuntime {
     options?: MeasureEvaluationOptions
   ): number | null;
   env: MetricEvaluationEnvironment;
+}
+
+export function buildTransformHelpers(
+  env: MetricEvaluationEnvironment
+): TransformHelpers {
+  const rawGetFilterValue = getFilterValue;
+  return {
+    env,
+    rows(tableName: string): RowSequence {
+      const tableRows = env.db.tables[tableName] ?? [];
+      return rowsToEnumerable(tableRows);
+    },
+    first(tableName: string, predicate: (r: Row) => boolean): Row | undefined {
+      const tableRows = env.db.tables[tableName] ?? [];
+      return tableRows.find(predicate);
+    },
+    filterRows(
+      tableName: string,
+      predicate: (r: Row) => boolean
+    ): RowSequence {
+      const tableRows = env.db.tables[tableName] ?? [];
+      return rowsToEnumerable(tableRows).where(predicate);
+    },
+    getFilterValue(field: string, ctx: MetricContext): FilterValue | undefined {
+      return rawGetFilterValue(ctx, field);
+    },
+    mergeFilters,
+    f,
+  };
 }
 
 /**
@@ -1005,6 +1055,10 @@ export const demoDb: InMemoryDb = {
       { year: 2025, regionId: "NA", budgetAmount: 2200 },
       { year: 2025, regionId: "EU", budgetAmount: 1600 },
     ],
+    calendarMapping: [
+      { fromYear: 2025, fromMonth: 2, toYear: 2024, toMonth: 12 },
+      { fromYear: 2025, fromMonth: 1, toYear: 2024, toMonth: 11 },
+    ],
   },
 };
 
@@ -1079,6 +1133,16 @@ export const demoTableDefinitions: TableDefinitionRegistry = {
       },
     },
   },
+  calendarMapping: {
+    name: "calendarMapping",
+    grain: ["fromYear", "fromMonth"],
+    columns: {
+      fromYear: { role: "attribute", dataType: "number" },
+      fromMonth: { role: "attribute", dataType: "number" },
+      toYear: { role: "attribute", dataType: "number" },
+      toMonth: { role: "attribute", dataType: "number" },
+    },
+  },
 };
 
 export const demoAttributes: AttributeRegistry = {
@@ -1112,9 +1176,10 @@ export const demoMeasures: MeasureRegistry = {
 /**
  * Example context transforms (time intelligence).
  */
-const ytdTransform: ContextTransform = (ctx) => {
-  const year = asNumber(getFilterValue(ctx, "year"));
-  const month = asNumber(getFilterValue(ctx, "month"));
+const ytdTransform: ContextTransform = (ctx, helpers) => {
+  const { getFilterValue, mergeFilters, f } = helpers;
+  const year = asNumber(getFilterValue("year", ctx));
+  const month = asNumber(getFilterValue("month", ctx));
   if (year == null || month == null) return ctx;
   return {
     ...ctx,
@@ -1126,8 +1191,9 @@ const ytdTransform: ContextTransform = (ctx) => {
   };
 };
 
-const lastYearTransform: ContextTransform = (ctx) => {
-  const year = asNumber(getFilterValue(ctx, "year"));
+const lastYearTransform: ContextTransform = (ctx, helpers) => {
+  const { getFilterValue, mergeFilters, f } = helpers;
+  const year = asNumber(getFilterValue("year", ctx));
   if (year == null) return ctx;
   return {
     ...ctx,
@@ -1138,10 +1204,38 @@ const lastYearTransform: ContextTransform = (ctx) => {
   };
 };
 
+const mappedPeriodTransform: ContextTransform = (ctx, helpers) => {
+  const { getFilterValue, first, mergeFilters, f } = helpers;
+  const year = asNumber(getFilterValue("year", ctx));
+  const month = asNumber(getFilterValue("month", ctx));
+  if (year == null || month == null) return ctx;
+  const row = first(
+    "calendarMapping",
+    (r) => r.fromYear === year && r.fromMonth === month
+  );
+  if (!row) {
+    return ctx;
+  }
+  const { toYear, toMonth } = row as {
+    toYear: number;
+    toMonth: number;
+  };
+  const newFilter = mergeFilters(
+    omitFilterFields(ctx.filter, "year", "month"),
+    f.eq("year", toYear),
+    f.eq("month", toMonth)
+  );
+  return {
+    ...ctx,
+    filter: newFilter,
+  };
+};
+
 export const demoTransforms: ContextTransformsRegistry = {
   ytd: ytdTransform,
   lastYear: lastYearTransform,
   ytdLastYear: composeTransforms(ytdTransform, lastYearTransform),
+  mappedPeriod: mappedPeriodTransform,
 };
 
 export const demoMetrics: MetricRegistry = {
@@ -1241,6 +1335,14 @@ export const demoMetrics: MetricRegistry = {
     description: "YTD of total sales amount in previous year.",
     format: "currency",
   }),
+  salesAmountMappedPeriod: contextTransformMetric({
+    name: "salesAmountMappedPeriod",
+    baseMetric: "totalSalesAmount",
+    transform: demoTransforms.mappedPeriod,
+    description:
+      "Total sales amount evaluated in a mapped period using calendarMapping.",
+    format: "currency",
+  }),
   budgetYTD: contextTransformMetric({
     name: "budgetYTD",
     baseMetric: "totalBudget",
@@ -1300,6 +1402,7 @@ if (typeof require !== "undefined" && typeof module !== "undefined" && require.m
     "salesAmountYTD",
     "salesAmountLastYear",
     "salesAmountYTDLastYear",
+    "salesAmountMappedPeriod",
     "budgetYTD",
     "budgetLastYear",
     "salesVsBudgetPctYTD",
