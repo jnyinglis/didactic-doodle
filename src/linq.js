@@ -749,6 +749,106 @@ Enumerable.prototype.pairwise = function (selector) {
     });
 };
 
+// Overload:function(size)
+// Overload:function(size, selector<window, index>)
+// Overload:function(size, step)
+// Overload:function(size, step, selector<window, index>)
+Enumerable.prototype.windowed = function (size, stepOrSelector, selector) {
+    if (size == null) {
+        throw new Error('windowed: size must be >= 1');
+    }
+
+    var source = this;
+    var step = 1;
+
+    if (typeof stepOrSelector === Types.Number) {
+        step = stepOrSelector;
+    }
+    else if (stepOrSelector != null) {
+        selector = stepOrSelector;
+    }
+
+    if (selector == null) {
+        selector = Functions.Identity;
+    }
+
+    selector = Utils.createLambda(selector);
+
+    if (size <= 0) {
+        throw new Error('windowed: size must be >= 1');
+    }
+
+    if (step == null || step <= 0) {
+        throw new Error('windowed: step must be >= 1');
+    }
+
+    return Enumerable.defer(function () {
+        var arr = source.toArray();
+        var result = [];
+
+        for (var start = 0, idx = 0; start + size <= arr.length; start += step, idx++) {
+            var window = arr.slice(start, start + size);
+            result.push(selector(window, idx));
+        }
+
+        return Enumerable.from(result);
+    });
+};
+
+// Overload:function(offset, defaultValue)
+Enumerable.prototype.lag = function (offset, defaultValue) {
+    var source = this;
+
+    if (offset == null) {
+        throw new Error('lag: offset must be >= 0');
+    }
+
+    offset = Math.floor(offset);
+
+    if (offset < 0) {
+        throw new Error('lag: offset must be >= 0');
+    }
+
+    return Enumerable.defer(function () {
+        var arr = source.toArray();
+        var result = new Array(arr.length);
+
+        for (var i = 0; i < arr.length; i++) {
+            var previousIndex = i - offset;
+            result[i] = previousIndex >= 0 ? arr[previousIndex] : defaultValue;
+        }
+
+        return Enumerable.from(result);
+    });
+};
+
+// Overload:function(offset, defaultValue)
+Enumerable.prototype.lead = function (offset, defaultValue) {
+    var source = this;
+
+    if (offset == null) {
+        throw new Error('lead: offset must be >= 0');
+    }
+
+    offset = Math.floor(offset);
+
+    if (offset < 0) {
+        throw new Error('lead: offset must be >= 0');
+    }
+
+    return Enumerable.defer(function () {
+        var arr = source.toArray();
+        var result = new Array(arr.length);
+
+        for (var i = 0; i < arr.length; i++) {
+            var nextIndex = i + offset;
+            result[i] = nextIndex < arr.length ? arr[nextIndex] : defaultValue;
+        }
+
+        return Enumerable.from(result);
+    });
+};
+
 // Overload:function(func)
 // Overload:function(seed,func<value,element>)
 Enumerable.prototype.scan = function (seed, func) {
@@ -1781,6 +1881,66 @@ Enumerable.prototype.partitionBy = function (keySelector, elementSelector, resul
                 return false;
             },
             function () { Utils.dispose(enumerator); });
+    });
+};
+
+Enumerable.prototype.windowBy = function (partitionKeySelector, orderKeySelector, frame, selector) {
+    var source = this;
+    if (frame == null) {
+        throw new Error('windowBy: frame is required');
+    }
+
+    partitionKeySelector = Utils.createLambda(partitionKeySelector);
+    orderKeySelector = Utils.createLambda(orderKeySelector);
+    selector = Utils.createLambda(selector);
+
+    var preceding = frame.preceding;
+    var following = frame.following;
+    var requireFullWindow = frame.requireFullWindow;
+
+    if (preceding == null) preceding = 0;
+    if (following == null) following = 0;
+    if (requireFullWindow == null) requireFullWindow = true;
+
+    if (preceding < 0 || following < 0) {
+        throw new Error('windowBy: preceding/following must be >= 0');
+    }
+
+    var fullWindowSize = preceding + following + 1;
+
+    return Enumerable.defer(function () {
+        var groups = source
+            .groupBy(partitionKeySelector, Functions.Identity)
+            .toArray();
+
+        var results = [];
+
+        for (var g = 0; g < groups.length; g++) {
+            var group = groups[g];
+            var key = group.key();
+            var partition = group
+                .orderBy(orderKeySelector)
+                .toArray();
+
+            for (var i = 0; i < partition.length; i++) {
+                var start = Math.max(0, i - preceding);
+                var end = Math.min(partition.length - 1, i + following);
+                var rawWindow = partition.slice(start, end + 1);
+                var window = (requireFullWindow && rawWindow.length < fullWindowSize)
+                    ? []
+                    : rawWindow;
+
+                results.push(selector({
+                    partitionKey: key,
+                    row: partition[i],
+                    index: i,
+                    partition: partition,
+                    window: window
+                }));
+            }
+        }
+
+        return Enumerable.from(results);
     });
 };
 

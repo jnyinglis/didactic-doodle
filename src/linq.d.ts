@@ -1,5 +1,3 @@
-export as namespace Enumerable;
-
 declare namespace Enumerable {
   export let Utils: {
     createLambda(expression: null): (x: unknown) => unknown;
@@ -39,6 +37,20 @@ declare namespace Enumerable {
   export function unfold<T>(seed: T, func: (value: T) => T): IEnumerable<T>;
   export function defer<T>(enumerableFactory: () => IEnumerable<T>): IEnumerable<T>;
 
+  export type WindowFrame = {
+    preceding: number;
+    following: number;
+    requireFullWindow?: boolean;
+  };
+
+  export interface WindowContext<T, TPartitionKey = unknown> {
+    partitionKey: TPartitionKey;
+    row: T;
+    index: number;
+    partition: T[];
+    window: T[];
+  }
+
   export interface IEnumerable<T> {
     (getEnumerator: () => IEnumerator<T>): void;
     getEnumerator(): IEnumerator<T>;
@@ -50,6 +62,14 @@ declare namespace Enumerable {
     traverseDepthFirst<TResult>(childrenSelector: (element: T) => IEnumerable<T>, resultSelector?: (element: T, nestLevel: number) => TResult): IEnumerable<TResult>;
     flatten(): IEnumerable<unknown>;
     pairwise<TResult>(selector: (prev: T, current: T) => TResult): IEnumerable<TResult>;
+    windowed(size: number): IEnumerable<T[]>;
+    windowed(size: number, step: number): IEnumerable<T[]>;
+    windowed<TResult>(size: number, selector: (window: T[], index: number) => TResult): IEnumerable<TResult>;
+    windowed<TResult>(size: number, step: number, selector: (window: T[], index: number) => TResult): IEnumerable<TResult>;
+    lag(offset: number): IEnumerable<T | undefined>;
+    lag<TDefault>(offset: number, defaultValue: TDefault): IEnumerable<T | TDefault>;
+    lead(offset: number): IEnumerable<T | undefined>;
+    lead<TDefault>(offset: number, defaultValue: TDefault): IEnumerable<T | TDefault>;
     scan(func: (prev: T, current: T) => T): IEnumerable<T>;
     scan<TAccumulate>(seed: TAccumulate, func: (prev: TAccumulate, current: T) => TAccumulate): IEnumerable<TAccumulate>;
     select<TResult>(selector: (element: T, index: number) => TResult): IEnumerable<TResult>;
@@ -133,6 +153,7 @@ declare namespace Enumerable {
     partitionBy<TKey, TElement>(keySelector: (element: T) => TKey, elementSelector: (element: T) => TElement): IEnumerable<IGrouping<TKey, TElement>>;
     partitionBy<TKey, TElement, TResult>(keySelector: (element: T) => TKey, elementSelector: (element: T) => TElement, resultSelector: (key: TKey, element: IEnumerable<TElement>) => TResult): IEnumerable<TResult>;
     partitionBy<TKey, TElement, TResult, TCompare>(keySelector: (element: T) => TKey, elementSelector: (element: T) => TElement, resultSelector: (key: TKey, element: IEnumerable<TElement>) => TResult, compareSelector: (element: TKey) => TCompare): IEnumerable<TResult>;
+    windowBy<TKey, TOrderKey, TResult>(partitionKeySelector: (element: T) => TKey, orderKeySelector: (element: T) => TOrderKey, frame: WindowFrame, selector: (ctx: WindowContext<T, TKey>) => TResult): IEnumerable<TResult>;
     buffer(count: number): IEnumerable<T[]>;
     aggregate(func: (prev: T, current: T) => T): T;
     aggregate<TAccumulate>(seed: TAccumulate, func: (prev: TAccumulate, current: T) => TAccumulate): TAccumulate;
@@ -254,5 +275,4 @@ declare namespace Enumerable {
   }
 }
 
-declare const EnumerableJS: typeof Enumerable;
-export default EnumerableJS;
+export default Enumerable;
