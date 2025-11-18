@@ -1,7 +1,9 @@
 import { expect } from "chai";
 import {
   attr,
+  evaluateMetric,
   f,
+  factMeasure,
   InMemoryDb,
   measure,
   MetricEvaluationEnvironment,
@@ -10,7 +12,9 @@ import {
   RelationalMetricRegistry,
   runRelationalQuery,
   SemanticModel,
+  TableTransform,
   projectMeasureValues,
+  rowsToEnumerable,
 } from "../src/semanticEngine";
 
 const demoDb: InMemoryDb = {
@@ -37,6 +41,15 @@ const demoDb: InMemoryDb = {
       { storeId: 2, productId: 100, year: 2025, month: 2, amount: 180 },
       { storeId: 2, productId: 101, year: 2025, month: 1, amount: 220 },
       { storeId: 2, productId: 101, year: 2025, month: 2, amount: 260 },
+      // prior year rows for transform coverage
+      { storeId: 1, productId: 100, year: 2024, month: 1, amount: 90 },
+      { storeId: 1, productId: 100, year: 2024, month: 2, amount: 110 },
+      { storeId: 1, productId: 101, year: 2024, month: 1, amount: 130 },
+      { storeId: 1, productId: 101, year: 2024, month: 2, amount: 170 },
+      { storeId: 2, productId: 100, year: 2024, month: 1, amount: 80 },
+      { storeId: 2, productId: 100, year: 2024, month: 2, amount: 95 },
+      { storeId: 2, productId: 101, year: 2024, month: 1, amount: 140 },
+      { storeId: 2, productId: 101, year: 2024, month: 2, amount: 160 },
     ],
     budget: [
       { storeId: 1, productId: 100, year: 2025, budgetAmount: 5000 },
@@ -44,7 +57,17 @@ const demoDb: InMemoryDb = {
       { storeId: 2, productId: 100, year: 2025, budgetAmount: 4000 },
       { storeId: 2, productId: 101, year: 2025, budgetAmount: 4500 },
     ],
+    last_year_transform: [{ currYear: 2025, prevYear: 2024 }],
   },
+};
+
+const lastYearTransform: TableTransform = {
+  id: "LastYear",
+  relation: () => rowsToEnumerable(demoDb.tables.last_year_transform ?? []),
+  anchorAttr: "year",
+  fromColumn: "currYear",
+  toColumn: "prevYear",
+  factKey: "year",
 };
 
 const tables: SemanticModel["tables"] = {
@@ -132,11 +155,21 @@ const relationalMetrics: RelationalMetricRegistry = {
   }),
 };
 
+const scalarMetrics = {
+  lastYearSales: factMeasure({
+    name: "lastYearSales",
+    factTable: "sales",
+    column: "amount",
+    aggregate: "sum",
+    transform: lastYearTransform,
+  }),
+};
+
 const model: SemanticModel = {
   tables,
   attributes,
   measures,
-  metrics: {},
+  metrics: scalarMetrics,
   relationalMetrics,
   transforms: {},
 };
@@ -222,5 +255,15 @@ describe("relational semantic engine", () => {
       yearlyBudget: 19500,
       negativeSales: null,
     });
+  });
+
+  it("applies table transforms before aggregating fact measures", () => {
+    const result = evaluateMetric(
+      "lastYearSales",
+      env,
+      { filter: f.eq("year", 2025) }
+    );
+
+    expect(result).to.equal(975);
   });
 });
