@@ -15,7 +15,9 @@ export function rowsToEnumerable(rows: Row[] = []) {
   return Enumerable.from(rows ?? []);
 }
 
-export type RowSequence = ReturnType<typeof rowsToEnumerable>;
+export type RowSequence = Enumerable.IEnumerable<Row>;
+
+export type NumberSequence = Enumerable.IEnumerable<number>;
 
 /* --------------------------------------------------------------------------
  * TABLE + ATTRIBUTE + MEASURE DEFINITIONS
@@ -341,16 +343,17 @@ function getFilterValue(
 }
 
 export function applyContextToTable(
-  rows: Row[],
+  rows: Row[] | RowSequence,
   context: FilterContext,
   grain: string[]
 ): RowSequence {
   const node = normalizeFilterContext(context);
-  if (!node) return rowsToEnumerable(rows);
+  const sequence = Array.isArray(rows) ? rowsToEnumerable(rows) : rows;
+  if (!node) return sequence;
   const allowed = new Set(grain);
   const pruned = pruneFilterNode(node, allowed);
-  if (!pruned) return rowsToEnumerable(rows);
-  return rowsToEnumerable(rows).where((r: Row) => evaluateFilterNode(pruned, r));
+  if (!pruned) return sequence;
+  return sequence.where((r: Row) => evaluateFilterNode(pruned, r));
 }
 
 function serializeFilter(filter?: FilterContext): any {
@@ -483,7 +486,7 @@ export function projectMeasureValues(
   measureName: string,
   ctx: MetricContext,
   env: MetricEvaluationEnvironment
-): RowSequence {
+): NumberSequence {
   const def = env.model.measures[measureName];
   if (!def) {
     throw new Error(`Unknown measure: ${measureName}`);
@@ -492,14 +495,14 @@ export function projectMeasureValues(
   if (!tableDef) {
     throw new Error(`Unknown table: ${def.table}`);
   }
-  const rows = env.db.tables[def.table] ?? [];
+  const rows = rowsToEnumerable(env.db.tables[def.table] ?? []);
   const grain = ctx.grain ?? def.grain ?? tableDef.grain;
   const filtered = applyContextToTable(rows, ctx.filter, grain);
   const column = def.column ?? def.name;
 
   return filtered
     .select((r: Row) => {
-      const raw = Number(r[column]);
+      const raw = Number((r as any)[column]);
       return Number.isNaN(raw) ? null : raw;
     })
     .where((num: number | null): num is number => typeof num === "number");
@@ -614,7 +617,7 @@ export function contextTransformMetric(opts: {
 
 export type RelAggregateKind = "sum" | "avg" | "min" | "max" | "count";
 
-export type RelAggregateFn = (values: RowSequence) => number | null;
+export type RelAggregateFn = (values: NumberSequence) => number | null;
 
 export interface RelAggregateMetricOptions {
   name: string;
@@ -628,7 +631,7 @@ export interface RelAggregateMetricOptions {
 export interface RelExpressionMetricOptions {
   name: string;
   measure: string;
-  expr: (values: RowSequence) => number;
+  expr: (values: NumberSequence) => number;
   grain?: GrainSpec;
   description?: string;
   format?: string;
@@ -636,16 +639,16 @@ export interface RelExpressionMetricOptions {
 
 function buildRelAggregateFn(agg: RelAggregateKind | RelAggregateFn): RelAggregateFn {
   if (typeof agg === "function") return agg;
-  return (values: RowSequence) => {
+  return (values: NumberSequence) => {
     switch (agg) {
       case "sum":
-        return values.sum((v: any) => Number(v));
+        return values.sum();
       case "avg":
-        return values.average((v: any) => Number(v));
+        return values.average();
       case "min":
-        return values.min((v: any) => Number(v));
+        return values.min();
       case "max":
-        return values.max((v: any) => Number(v));
+        return values.max();
       case "count":
         return values.count();
       default:
@@ -676,7 +679,7 @@ export function relAggregateMetric(opts: RelAggregateMetricOptions): RelationalM
       }
 
       const def = env.model.measures[opts.measure]!;
-      const factRows = env.db.tables[def.table] ?? [];
+      const factRows = rowsToEnumerable(env.db.tables[def.table] ?? []);
       const grainAttrs = effectiveGrain as string[];
 
       const filtered = applyContextToTable(factRows, ctx.filter, grainAttrs);
@@ -684,12 +687,12 @@ export function relAggregateMetric(opts: RelAggregateMetricOptions): RelationalM
 
       return filtered.groupBy(
         (r: Row) => JSON.stringify(pick(r, grainAttrs)),
-        null,
+        (r: Row) => r,
         (key: string, group: any) => {
           const keyObj = JSON.parse(key) as Row;
           const values = group
             .select((r: Row) => {
-              const raw = Number(r[column]);
+              const raw = Number((r as any)[column]);
               return Number.isNaN(raw) ? null : raw;
             })
             .where((num: number | null): num is number => typeof num === "number");
@@ -723,19 +726,19 @@ export function relExpressionMetric(opts: RelExpressionMetricOptions): Relationa
       }
 
       const def = env.model.measures[opts.measure]!;
-      const factRows = env.db.tables[def.table] ?? [];
+      const factRows = rowsToEnumerable(env.db.tables[def.table] ?? []);
       const grainAttrs = effectiveGrain as string[];
       const filtered = applyContextToTable(factRows, ctx.filter, grainAttrs);
       const column = def.column ?? def.name;
 
       return filtered.groupBy(
         (r: Row) => JSON.stringify(pick(r, grainAttrs)),
-        null,
+        (r: Row) => r,
         (key: string, group: any) => {
           const keyObj = JSON.parse(key) as Row;
           const values = group
             .select((r: Row) => {
-              const raw = Number(r[column]);
+              const raw = Number((r as any)[column]);
               return Number.isNaN(raw) ? null : raw;
             })
             .where((num: number | null): num is number => typeof num === "number");
@@ -846,13 +849,13 @@ function matchesExpression(value: any, expr: FilterExpression): boolean {
       }
       return value === expr.value;
     case "lt":
-      return value < expr.value;
+      return value < Number(expr.value);
     case "lte":
-      return value <= expr.value;
+      return value <= Number(expr.value);
     case "gt":
-      return value > expr.value;
+      return value > Number(expr.value);
     case "gte":
-      return value >= expr.value;
+      return value >= Number(expr.value);
     case "between": {
       const from = ensureNumericRangeValue(expr.value as number, expr.field, "between-from");
       const to = ensureNumericRangeValue(expr.value2 as number, expr.field, "between-to");
@@ -864,6 +867,18 @@ function matchesExpression(value: any, expr: FilterExpression): boolean {
         : false;
     default:
       return false;
+  }
+}
+
+function formatValue(value: number | null, format?: string): string | number | null {
+  if (value == null) return null;
+  switch (format) {
+    case "currency":
+      return `$${value.toFixed(2)}`;
+    case "percent":
+      return `${value.toFixed(2)}%`;
+    default:
+      return value;
   }
 }
 
@@ -1057,7 +1072,7 @@ export function buildFrameEnumerable(
         }
         return out;
       })
-      .distinct((a: Row, b: Row) => attrs.every((k) => a[k] === b[k]));
+      .distinct((row: Row) => JSON.stringify(pick(row, attrs)));
   });
 
   let frame: RowSequence = domainEnumerables[0];
@@ -1112,23 +1127,23 @@ export function runRelationalQuery(
           : baseContext.grain,
     };
 
-    const metricRel = metric.evalEnumerable(metricCtx, env);
-    const sample = metricRel.firstOrDefault();
-    const joinAttrs =
-      sample == null
-        ? []
-        : Object.keys(sample).filter((k) => k !== metric.name);
+    const metricRows = metric
+      .evalEnumerable(metricCtx, env)
+      .toArray();
+    const metricRel = rowsToEnumerable(metricRows);
+    const joinAttrs = Array.isArray(metricCtx.grain) ? metricCtx.grain : [];
 
     if (joinAttrs.length === 0) {
       // Global metric: repeat scalar across all frame rows
+      const sample = metricRows[0];
       const val = sample ? (sample as any)[metric.name] : null;
       result = result.select((r: Row) => ({
         ...r,
         [metric.name]: val,
       }));
     } else {
-      // Use LINQ leftOuterJoin (or leftJoin depending on linq.js API)
-      result = (result as any).leftOuterJoin(
+      // Use LINQ left join so the frame always wins
+      result = (result as any).leftJoin(
         metricRel,
         (l: Row) => keyFromRow(l, joinAttrs),
         (r: Row) => keyFromRow(r, joinAttrs),
