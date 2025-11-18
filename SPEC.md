@@ -13,14 +13,14 @@ This spec elaborates the design, key changes, data migrations, testing plans, an
 ### Objective 1 — Adopt `linq.js`
 - [x] Bundled `Enumerable` is imported inside `semanticEngine.ts` along with the `rowsToEnumerable` helper so every caller works with fluent LINQ sequences.
 - [x] The bespoke `RowSequence` implementation has been removed in favor of the `Enumerable` return type, and all callers (`applyContextToTable`, metric evaluators, transforms) now operate directly on those sequences.
-- [x] Execution paths such as `applyContextToTable` and the scalar query builder (`executeQuery`) return `Enumerable` instances and compose `where`, `select`, `groupBy`, and aggregate helpers instead of mutating arrays.
+- [x] Execution paths such as `applyContextToTable` and the relational query runner (`runRelationalQuery`) return `Enumerable` instances and compose `where`, `select`, `groupBy`, and aggregate helpers instead of mutating arrays.
 - [x] The repository ships with `src/linq.d.ts`, providing the typings required for the imported operators to satisfy TypeScript.
 - [ ] Add additional regression coverage that specifically exercises the newly available LINQ helpers (e.g., joins, ordering, nested groupings) beyond the existing unit tests.
 
 ### Objective 2 — Unify Tables
 - [x] Demo data lives under a single `db.tables` map, and the engine code consumes the unified structure throughout.
 - [x] Table metadata is defined through `tableDefinitions` so attributes, measures, relationships, and labels are all described in one place instead of the former fact/dimension split.
-- [x] Query APIs (metrics, helper functions, and the scalar query builder) reference `table`/`tableForRows` consistently, eliminating the previous `fact*` terminology.
+- [x] Query APIs (metrics, helper functions, and the relational query flow) reference `table`/`tableForRows` consistently, eliminating the previous `fact*` terminology.
 - [x] Execution logic (filtering, grouping, label enrichment) reads from the unified metadata to determine grain and lookup joins.
 - [ ] Produce migration guidance / changelog notes that explain how downstream callers should update from `db.dimensions` + `db.facts` to the new unified table layout.
 
@@ -52,7 +52,7 @@ This spec elaborates the design, key changes, data migrations, testing plans, an
 3. **Rewrite Execution Paths:**
    - `applyContextToFact` should return an `Enumerable<Row>` rather than a simple array.
    - Metric evaluators (`factMeasure`, `expression`, `derived`, context transform base) should call `sequence.sum(...)`, `sequence.count()`, `sequence.aggregate(...)`, etc.
-   - The scalar query builder must build row groups through `.groupBy`, `.select`, and `.orderBy` for clarity and to reduce mutable state.
+   - The relational executor must build row groups through `.groupBy`, `.select`, and `.orderBy` for clarity and to reduce mutable state.
 
 4. **Type Support:**
    - Introduce/update declaration files for the `Enumerable` type, exposing at least the methods used by the engine and demo metrics.
@@ -108,11 +108,11 @@ interface InMemoryDb {
 3. **API Changes:**
    - Update metric definitions to reference `table`/`column` rather than `factTable`/`factColumn`.
    - Rename query request properties (e.g., `factForRows` → `tableForRows`).
-   - Adjust helper functions (scalar query execution, context application, label enrichment) to operate on the unified metadata.
+   - Adjust helper functions (relational query execution, context application, label enrichment) to operate on the unified metadata.
 
 4. **Execution Logic:**
    - Filtering should consult the table definition to know which attributes exist on the requested grain.
-   - Grouping logic in the scalar executor should dynamically inspect the grain/relationships from the table definition.
+   - Grouping logic in the relational executor should dynamically inspect the grain/relationships from the table definition.
    - Label enrichment should use the `labelFor` metadata to join tables for readable captions.
 
 5. **Documentation & Examples:**

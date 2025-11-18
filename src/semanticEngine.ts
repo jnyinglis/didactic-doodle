@@ -1019,18 +1019,6 @@ function matchesExpression(value: any, expr: FilterExpression): boolean {
   }
 }
 
-function formatValue(value: number | null, format?: string): string | number | null {
-  if (value == null) return null;
-  switch (format) {
-    case "currency":
-      return `$${value.toFixed(2)}`;
-    case "percent":
-      return `${value.toFixed(2)}%`;
-    default:
-      return value;
-  }
-}
-
 function ensureNumericRangeValue(
   raw: number,
   field: string,
@@ -1044,152 +1032,14 @@ function ensureNumericRangeValue(
 }
 
 /* --------------------------------------------------------------------------
- * QUERY ENGINE (SCALAR PATH)
+ * RELATIONAL QUERY EXECUTION
  * -------------------------------------------------------------------------- */
 
 interface QuerySpec {
-  table: string;
+  table?: string;
   attributes: string[];
   metrics: string[];
   filters?: FilterContext;
-}
-
-export interface QueryBuilder {
-  addAttributes(...attrs: string[]): QueryBuilder;
-  addMetrics(...metricNames: string[]): QueryBuilder;
-  where(filter: FilterContext): QueryBuilder;
-  build(): QuerySpec;
-  run(): Row[];
-}
-
-export interface Engine {
-  query(table: string): QueryBuilder;
-  evaluateMetric(name: string, ctx?: MetricContext): number | null;
-  listMetrics(): MetricDefinition[];
-  getMetric(name: string): MetricDefinition | undefined;
-}
-
-export function buildEngine(env: MetricEvaluationEnvironment): Engine {
-  const model = env.model;
-  return {
-    query(table: string): QueryBuilder {
-      const spec: QuerySpec = {
-        table,
-        attributes: [],
-        metrics: [],
-      };
-      return {
-        addAttributes(...attrs: string[]): QueryBuilder {
-          spec.attributes.push(...attrs);
-          return this;
-        },
-        addMetrics(...metricNames: string[]): QueryBuilder {
-          spec.metrics.push(...metricNames);
-          return this;
-        },
-        where(filter: FilterContext): QueryBuilder {
-          spec.filters = filter;
-          return this;
-        },
-        build(): QuerySpec {
-          return spec;
-        },
-        run(): Row[] {
-          return executeQuery(env, spec);
-        },
-      };
-    },
-
-    evaluateMetric(name: string, ctx: MetricContext = {}): number | null {
-      return evaluateMetric(name, env, ctx);
-    },
-
-    listMetrics(): MetricDefinition[] {
-      return Object.values(model.metrics);
-    },
-
-    getMetric(name: string): MetricDefinition | undefined {
-      return model.metrics[name];
-    },
-  };
-}
-
-function executeQuery(
-  env: MetricEvaluationEnvironment,
-  spec: QuerySpec
-): Row[] {
-  const tableDef = env.model.tables[spec.table];
-  if (!tableDef) throw new Error(`Unknown table: ${spec.table}`);
-
-  const tableRows = env.db.tables[spec.table];
-  if (!tableRows) throw new Error(`Missing rows for table: ${spec.table}`);
-
-  const filtered = applyContextToTable(tableRows, spec.filters, tableDef.grain);
-
-  const frame: RowSequence = spec.attributes.length
-    ? filtered
-        .select((row: Row) => pick(row, spec.attributes))
-        .distinct((row: Row) => keyFromRow(row, spec.attributes))
-    : rowsToEnumerable([{}]);
-
-  const runtime = buildMetricRuntime(env);
-  const cache = new Map<string, number | null>();
-
-  const evaluated = frame.select((dimensionRow: Row) => {
-    const dimensionFilter = dimensionFilterFromRow(
-      dimensionRow,
-      spec.attributes
-    );
-    const metricCtx: MetricContext = {
-      filter: mergeFilters(spec.filters, dimensionFilter),
-      grain: spec.attributes,
-    };
-
-    const metricValues: Row = {};
-    for (const metricName of spec.metrics) {
-      const metric = env.model.metrics[metricName];
-      if (!metric) {
-        throw new Error(`Unknown metric: ${metricName}`);
-      }
-      const numericValue = evaluateMetricWithRuntime(
-        metricName,
-        metricCtx,
-        runtime,
-        env,
-        cache
-      );
-      metricValues[metricName] = formatValue(numericValue, metric?.format);
-    }
-
-    return {
-      ...dimensionRow,
-      ...metricValues,
-    };
-  });
-
-  const enriched = evaluated.select((row: Row) =>
-    enrichDimensions(row, env.db, env.model.tables)
-  );
-
-  return enriched.toArray();
-}
-
-function dimensionFilterFromRow(
-  row: Row,
-  attrs: string[]
-): FilterContext | undefined {
-  if (attrs.length === 0) return undefined;
-  const expressions = attrs
-    .map((attr) => {
-      if (!(attr in row)) {
-        return undefined;
-      }
-      return f.eq(attr, row[attr] as FilterPrimitive);
-    })
-    .filter((expr): expr is FilterExpression => Boolean(expr));
-
-  if (expressions.length === 0) return undefined;
-  return expressions.length === 1 ? expressions[0] : f.and(...expressions);
 }
 
 function evaluateMetricWithRuntime(
