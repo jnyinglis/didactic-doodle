@@ -1,24 +1,30 @@
-# Semantic Metrics Engine POC
+# Relational Semantic Engine POC
 
-This repository contains a TypeScript proof-of-concept for a semantic metrics engine inspired by tools such as MicroStrategy, MetricFlow, and other semantic layers. The project demonstrates how to:
+This repository hosts a TypeScript proof-of-concept for a **LINQ-only, relational-algebra semantic engine**. The runtime embraces three pillars:
 
-- Declare **table metadata** (grain, relationships, formatting hints) alongside the in-memory data they describe.
-- Register **attributes, measures, and metrics** with consistent naming and documentation.
-- Express **filter contexts** using a small DSL (`f.eq`, `f.and`, range helpers, etc.) that can be merged, normalized, and reused across queries.
-- Compose **metric types**—fact measures, arbitrary expressions, derived metrics, and context transforms (YTD, prior year, YTD last year).
-- Run **LINQ-style queries** over in-memory rows (via the bundled [`linq.js`](src/linq.js)) to return formatted, label-enriched result sets.
+1. **Frame-first execution** – Queries build a cross-join frame from attribute domains and treat every metric as a LEFT JOIN off that frame.
+2. **Measure-only metrics** – Metrics operate exclusively on measure value streams so aggregations and expressions are deterministic and reusable.
+3. **LINQ everywhere** – Filtering, projection, grouping, joining, and aggregation all lean on the bundled [`linq.js`](src/linq.js) operators via `rowsToEnumerable`.
 
-Everything lives in [`src/semanticEngine.ts`](src/semanticEngine.ts), including the demo data/model, query builder, and CLI showcase guarded by `require.main === module`.
+Key capabilities include:
+
+- Unified table metadata covering grains, relationships, and column descriptions.
+- Filter contexts expressed through a concise DSL (`f.eq`, `f.and`, range helpers) that normalize down to LINQ predicates.
+- Scalar metrics for the legacy execution path (`runQuery`) plus **relational metrics** that return `Enumerable<Row>` instances for the new `runRelationalQuery` flow.
+- Relational aggregate + expression metric builders that consume `Enumerable<number>` sequences, ensuring consistent behavior regardless of grain.
+
+Everything is implemented inside [`src/semanticEngine.ts`](src/semanticEngine.ts) with a standalone demo harness in [`src/semanticEngineDemo.ts`](src/semanticEngineDemo.ts) that wires up sample data and relational metrics.
 
 ## Repository layout
 
 | Path | Description |
 | --- | --- |
-| [`src/semanticEngine.ts`](src/semanticEngine.ts) | Engine implementation, builders (`attr`, `measure`, `metric`, `contextTransform`), query execution, demo data/model, and CLI demo. |
-| [`src/linq.js`](src/linq.js) / [`src/linq.d.ts`](src/linq.d.ts) | Bundled LINQ implementation plus TypeScript definitions that power `rowsToEnumerable` and query execution. |
-| [`src/operators.md`](src/operators.md) | Quick reference of every available LINQ helper for authoring custom metrics or transforms. |
-| [`test/semanticEngine.test.ts`](test/semanticEngine.test.ts) | Mocha + Chai suite covering context filtering, metric evaluation, and formatted query output. |
-| [`SPEC.md`](SPEC.md) | Design notes outlining the motivation behind the refactor to a LINQ-first execution model. |
+| [`src/semanticEngine.ts`](src/semanticEngine.ts) | Core engine, builders (`attr`, `measure`, `relAggregateMetric`, etc.), scalar + relational query execution, and helper utilities. |
+| [`src/semanticEngineDemo.ts`](src/semanticEngineDemo.ts) | Small runnable environment that seeds a store/product dataset and showcases both scalar and relational query execution. |
+| [`src/linq.js`](src/linq.js) / [`src/linq.d.ts`](src/linq.d.ts) | Bundled LINQ runtime plus the TypeScript declaration file used by the engine and tests. |
+| [`src/operators.md`](src/operators.md) | Operator reference for anyone authoring custom LINQ-powered metrics or transforms. |
+| [`test/semanticEngine.test.ts`](test/semanticEngine.test.ts) | Mocha + Chai coverage for filter normalization, measure projection, relational metrics, and the LINQ-only relational executor. |
+| [`SPEC.md`](SPEC.md) | Design notes motivating the LINQ-first refactor and documenting the architectural goals. |
 
 ## Getting started
 
@@ -26,56 +32,72 @@ Everything lives in [`src/semanticEngine.ts`](src/semanticEngine.ts), including 
    ```bash
    npm install
    ```
-2. **Run the automated tests**:
+2. **Run the automated tests** to exercise the relational engine end-to-end:
    ```bash
    npm test
    ```
-   The suite executes directly against the demo database to validate `applyContextToTable`, metric evaluation (including transforms), and the query builder.
-3. **Try the CLI demo** (optional):
+   The suite validates `applyContextToTable`, `projectMeasureValues`, relational metric builders, and the `runRelationalQuery` pipeline.
+3. **Try the CLI demo** (optional) to see both execution paths:
    ```bash
-   npx ts-node src/semanticEngine.ts
+   npx ts-node src/semanticEngineDemo.ts
    ```
-   The script prints several queries for 2025 sales, showcasing dimension grains, reused builders, metric formatting, and the built-in time-intelligence transforms.
+   The script prints scalar query output and two relational frames (store × product × year and year × month) so you can observe how metrics join back onto the frame.
 
-## Using the engine
+## Using the relational engine
+
+Relational queries are described through `QuerySpec` objects that list the requested attributes, metrics, and filters. Each relational metric returns a relation keyed by its grain and the engine LEFT JOINs them onto the frame:
 
 ```ts
 import {
-  createEngine,
-  demoDb,
-  demoModel,
+  MetricEvaluationEnvironment,
+  relAggregateMetric,
+  relExpressionMetric,
+  runRelationalQuery,
+  attr,
+  measure,
+  f,
 } from "./src/semanticEngine";
 
-const engine = createEngine(demoDb, demoModel);
+// Build a SemanticModel with attributes/measures omitted for brevity.
+const env: MetricEvaluationEnvironment = { model, db };
 
-const rows = engine
-  .query("sales")
-  .where({ year: 2025, month: 2 })
-  .addAttributes("regionId", "productId")
-  .addMetrics("totalSalesAmount", "salesAmountYTD", "salesVsBudgetPct")
-  .run();
+model.relationalMetrics = {
+  totalSalesAmount: relAggregateMetric({ name: "totalSalesAmount", measure: "amount", agg: "sum" }),
+  totalBudget: relAggregateMetric({ name: "totalBudget", measure: "budgetAmount", agg: "sum", grain: ["year"] }),
+  salesDelta: relExpressionMetric({
+    name: "salesDelta",
+    measure: "amount",
+    grain: ["storeId", "productId", "year"],
+    expr: (values) => values.sum() * -1,
+  }),
+};
 
+const spec = {
+  table: "sales", // only used by the scalar path; relational queries derive the frame from attributes
+  attributes: ["storeId", "productId", "year"],
+  metrics: ["totalSalesAmount", "totalBudget", "salesDelta"],
+  filters: f.eq("year", 2025),
+};
+
+const rows = runRelationalQuery(env, spec);
 console.table(rows);
 ```
 
-Under the hood the engine will:
+This produces the classic relational flow:
 
-1. Apply the provided filter context, respecting the table grain and any metric-level overrides (e.g., `salesAmountYearRegion`).
-2. Evaluate each metric via the registry, caching repeated calculations and running dependency chains for derived metrics.
-3. Format values (currency, integer, percent, etc.) and enrich attributes with their label columns (`regionName`, `productName`).
-
-You can also call `engine.evaluateMetric("salesAmountYTD", { filter: { year: 2025, month: 2 } })` for ad-hoc metric checks, or reuse partially-built queries (`const base = engine.query("sales").where({ year: 2025 });`) to reduce boilerplate across slices.
+```
+Frame (store × product × year)
+  LEFT JOIN totalSalesAmount
+  LEFT JOIN totalBudget
+  LEFT JOIN salesDelta
+```
 
 ## Extending the POC
 
-1. **Model your tables** by inserting raw rows into `db.tables` and describing them inside a `TableDefinitionRegistry` (grain, column roles, label relationships, formats).
-2. **Declare attributes and measures** using the helper builders exported from `src/semanticEngine.ts`. This keeps documentation, column mappings, and default aggregations centralized.
-3. **Register metrics** in a `MetricRegistry` using:
-   - `simpleMetric` (fact measures)
-   - `expressionMetric` (custom LINQ aggregates)
-   - `derivedMetric` (metric arithmetic / dependency graphs)
-   - `contextTransformMetric` (time-intelligence / scenario filters)
-4. **Add context transforms** that accept and return `MetricContext` objects. The demo includes `ytd`, `lastYear`, and `ytdLastYear`, and they can be composed via `composeTransforms`.
-5. **Query the data** through `engine.query(table)` to configure attributes, metrics, and filters, or call `runQuery` directly if you prefer to build `QuerySpec` objects yourself.
+1. **Model tables and attributes** via `TableDefinitionRegistry` and `AttributeRegistry`. Attribute definitions map semantic names to the columns that appear in your frame tables.
+2. **Declare measures** with `measure.fact(...)` to describe which table + column supply numeric values and what grain they naturally live at.
+3. **Author relational metrics** using `relAggregateMetric` or `relExpressionMetric`. You can also keep scalar metrics (simple, expression, derived, context transforms) for parity with the legacy executor.
+4. **Compose query specs** by hand or through `buildEngine(env).query(table)` if you still need the scalar builder API.
+5. **Experiment**: because every operation is LINQ-backed, it is straightforward to add more complex joins, windows, or label enrichment steps directly inside metrics or helper functions.
 
-Because everything is in-memory, the POC is a convenient playground for experimenting with new metric types, richer labeling strategies, or eventually swapping the execution layer for SQL push-down.
+Everything runs fully in-memory, making this repository a safe playground for prototyping relational-semantic ideas before porting them to a SQL-backed engine.

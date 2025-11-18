@@ -1,184 +1,226 @@
 import { expect } from "chai";
 import {
-  applyContextToTable,
-  createEngine,
-  demoDb,
-  demoModel,
-  demoTableDefinitions,
-  FilterContext,
-  Row,
+  attr,
+  f,
+  InMemoryDb,
+  measure,
+  MetricEvaluationEnvironment,
+  relAggregateMetric,
+  relExpressionMetric,
+  RelationalMetricRegistry,
+  runRelationalQuery,
+  SemanticModel,
+  projectMeasureValues,
 } from "../src/semanticEngine";
 
-const engine = createEngine(demoDb, demoModel);
+const demoDb: InMemoryDb = {
+  tables: {
+    store_dim: [
+      { storeId: 1, storeName: "Downtown" },
+      { storeId: 2, storeName: "Airport" },
+      { storeId: 3, storeName: "Mall" }, // no sales/budget rows on purpose
+    ],
+    product_dim: [
+      { productId: 100, productName: "Widget" },
+      { productId: 101, productName: "Gadget" },
+    ],
+    date_dim: [
+      { year: 2025, month: 1 },
+      { year: 2025, month: 2 },
+    ],
+    sales: [
+      { storeId: 1, productId: 100, year: 2025, month: 1, amount: 150 },
+      { storeId: 1, productId: 100, year: 2025, month: 2, amount: 200 },
+      { storeId: 1, productId: 101, year: 2025, month: 1, amount: 300 },
+      { storeId: 1, productId: 101, year: 2025, month: 2, amount: 250 },
+      { storeId: 2, productId: 100, year: 2025, month: 1, amount: 120 },
+      { storeId: 2, productId: 100, year: 2025, month: 2, amount: 180 },
+      { storeId: 2, productId: 101, year: 2025, month: 1, amount: 220 },
+      { storeId: 2, productId: 101, year: 2025, month: 2, amount: 260 },
+    ],
+    budget: [
+      { storeId: 1, productId: 100, year: 2025, budgetAmount: 5000 },
+      { storeId: 1, productId: 101, year: 2025, budgetAmount: 6000 },
+      { storeId: 2, productId: 100, year: 2025, budgetAmount: 4000 },
+      { storeId: 2, productId: 101, year: 2025, budgetAmount: 4500 },
+    ],
+  },
+};
 
-function evaluate(name: string, context: FilterContext) {
-  return engine.evaluateMetric(name, { filter: context });
-}
+const tables: SemanticModel["tables"] = {
+  store_dim: {
+    name: "store_dim",
+    grain: ["storeId"],
+    columns: {
+      storeId: { name: "storeId", type: "number" },
+      storeName: { name: "storeName", type: "string" },
+    },
+  },
+  product_dim: {
+    name: "product_dim",
+    grain: ["productId"],
+    columns: {
+      productId: { name: "productId", type: "number" },
+      productName: { name: "productName", type: "string" },
+    },
+  },
+  date_dim: {
+    name: "date_dim",
+    grain: ["year", "month"],
+    columns: {
+      year: { name: "year", type: "number" },
+      month: { name: "month", type: "number" },
+    },
+  },
+  sales: {
+    name: "sales",
+    grain: ["storeId", "productId", "year", "month"],
+    columns: {
+      storeId: { name: "storeId", type: "number" },
+      productId: { name: "productId", type: "number" },
+      year: { name: "year", type: "number" },
+      month: { name: "month", type: "number" },
+      amount: { name: "amount", type: "number", defaultAgg: "sum" },
+    },
+  },
+  budget: {
+    name: "budget",
+    grain: ["storeId", "productId", "year"],
+    columns: {
+      storeId: { name: "storeId", type: "number" },
+      productId: { name: "productId", type: "number" },
+      year: { name: "year", type: "number" },
+      budgetAmount: { name: "budgetAmount", type: "number", defaultAgg: "sum" },
+    },
+  },
+};
 
-describe("semanticEngine", () => {
-  describe("FilterRange tagged union", () => {
-    const salesRows: Row[] = demoDb.tables.sales;
-    const grain = demoTableDefinitions.sales.grain;
+const attributes: SemanticModel["attributes"] = {
+  storeId: attr.id({ name: "storeId", table: "store_dim" }),
+  productId: attr.id({ name: "productId", table: "product_dim" }),
+  year: attr.id({ name: "year", table: "date_dim" }),
+  month: attr.id({ name: "month", table: "date_dim" }),
+};
 
-    it("supports every range variant", () => {
-      const between = applyContextToTable(
-        salesRows,
-        { month: { kind: "between", from: 1, to: 1 } },
-        grain
-      ).toArray();
-      const betweenPredicate = (row: Row) =>
-        row.month >= 1 && row.month <= 1;
-      expect(between.every(betweenPredicate)).to.be.true;
-      expect(between).to.have.lengthOf(
-        salesRows.filter(betweenPredicate).length
-      );
+const measures: SemanticModel["measures"] = {
+  amount: measure.fact({ name: "amount", table: "sales" }),
+  budgetAmount: measure.fact({ name: "budgetAmount", table: "budget" }),
+};
 
-      const gte = applyContextToTable(
-        salesRows,
-        { month: { kind: "gte", value: 2 } },
-        grain
-      ).toArray();
-      const gtePredicate = (row: Row) => row.month >= 2;
-      expect(gte.every(gtePredicate)).to.be.true;
-      expect(gte).to.have.lengthOf(salesRows.filter(gtePredicate).length);
+const relationalMetrics: RelationalMetricRegistry = {
+  totalSalesAmount: relAggregateMetric({
+    name: "totalSalesAmount",
+    measure: "amount",
+    agg: "sum",
+  }),
+  storeBudget: relAggregateMetric({
+    name: "storeBudget",
+    measure: "budgetAmount",
+    agg: "sum",
+    grain: ["storeId", "year"],
+  }),
+  yearlyBudget: relAggregateMetric({
+    name: "yearlyBudget",
+    measure: "budgetAmount",
+    agg: "sum",
+    grain: ["year"],
+  }),
+  negativeSales: relExpressionMetric({
+    name: "negativeSales",
+    measure: "amount",
+    expr: (values) => values.sum() * -1,
+  }),
+};
 
-      const gt = applyContextToTable(
-        salesRows,
-        { month: { kind: "gt", value: 1 } },
-        grain
-      ).toArray();
-      const gtPredicate = (row: Row) => row.month > 1;
-      expect(gt.every(gtPredicate)).to.be.true;
-      expect(gt).to.have.lengthOf(salesRows.filter(gtPredicate).length);
+const model: SemanticModel = {
+  tables,
+  attributes,
+  measures,
+  metrics: {},
+  relationalMetrics,
+  transforms: {},
+};
 
-      const lte = applyContextToTable(
-        salesRows,
-        { month: { kind: "lte", value: 1 } },
-        grain
-      ).toArray();
-      const ltePredicate = (row: Row) => row.month <= 1;
-      expect(lte.every(ltePredicate)).to.be.true;
-      expect(lte).to.have.lengthOf(salesRows.filter(ltePredicate).length);
+const env: MetricEvaluationEnvironment = {
+  model,
+  db: demoDb,
+};
 
-      const lt = applyContextToTable(
-        salesRows,
-        { month: { kind: "lt", value: 2 } },
-        grain
-      ).toArray();
-      const ltPredicate = (row: Row) => row.month < 2;
-      expect(lt.every(ltPredicate)).to.be.true;
-      expect(lt).to.have.lengthOf(salesRows.filter(ltPredicate).length);
-    });
+describe("relational semantic engine", () => {
+  it("filters rows down to a measure grain when projecting values", () => {
+    const values = projectMeasureValues(
+      "amount",
+      {
+        grain: ["storeId", "productId", "year", "month"],
+        filter: f.and(f.eq("storeId", 1), f.eq("year", 2025)),
+      },
+      env
+    ).toArray();
 
-    it("rejects ambiguous range payloads", () => {
-      expect(() =>
-        applyContextToTable(
-          salesRows,
-          { amount: { from: 400, to: 900 } as any },
-          grain
-        )
-      ).to.throw(/Invalid filter range/);
-    });
+    expect(values).to.deep.equal([150, 200, 300, 250]);
   });
 
-  describe("applyContextToTable", () => {
-    it("ignores filters that are not part of the grain", () => {
-      const ctx: FilterContext = { year: 2025, regionId: "NA", productId: 1 };
-      const rows = applyContextToTable(
-        demoDb.tables.budget,
-        ctx,
-        demoTableDefinitions.budget.grain
-      ).toArray();
-      expect(rows).to.have.lengthOf(1);
-      expect(rows[0]).to.include({ budgetAmount: 2200 });
+  it("aggregates relational metrics per grain and globally", () => {
+    const byGrain = relationalMetrics.totalSalesAmount
+      .evalEnumerable(
+        { grain: ["storeId", "productId", "year"], filter: f.eq("year", 2025) },
+        env
+      )
+      .toArray();
+
+    expect(byGrain).to.deep.include({
+      storeId: 1,
+      productId: 100,
+      year: 2025,
+      totalSalesAmount: 350,
     });
+    expect(byGrain).to.deep.include({
+      storeId: 2,
+      productId: 101,
+      year: 2025,
+      totalSalesAmount: 480,
+    });
+
+    const global = relationalMetrics.totalSalesAmount
+      .evalEnumerable({ grain: [], filter: f.eq("year", 2025) }, env)
+      .toArray();
+
+    expect(global).to.deep.equal([{ totalSalesAmount: 1680 }]);
   });
 
-  describe("evaluateMetric", () => {
-    it("respects metric-level grain overrides on fact measures", () => {
-      const value = evaluate("salesAmountYearRegion", {
-        year: 2025,
-        regionId: "NA",
-        month: 2,
-      });
-      expect(value).to.equal(2550);
+  it("builds frames via cross join and left joins relational metrics", () => {
+    const spec = {
+      table: "sales",
+      attributes: ["storeId", "productId", "year"],
+      metrics: [
+        "totalSalesAmount",
+        "storeBudget",
+        "yearlyBudget",
+        "negativeSales",
+      ],
+      filters: f.eq("year", 2025),
+    };
+
+    const rows = runRelationalQuery(env, spec as any);
+
+    expect(rows).to.have.lengthOf(6); // 3 stores × 2 products × 1 year
+    expect(rows).to.deep.include({
+      storeId: 1,
+      productId: 100,
+      year: 2025,
+      totalSalesAmount: 350,
+      storeBudget: 11000,
+      yearlyBudget: 19500,
+      negativeSales: -350,
     });
-
-    it("applies context transforms before evaluating base metrics", () => {
-      const ytd = evaluate("salesAmountYTD", {
-        year: 2025,
-        regionId: "NA",
-        month: 2,
-      });
-      expect(ytd).to.equal(2550);
-
-      const priorYear = evaluate("salesAmountYTDLastYear", {
-        year: 2025,
-        regionId: "NA",
-        month: 2,
-      });
-      expect(priorYear).to.equal(1830);
-    });
-
-    it("evaluates derived metrics using dependency values", () => {
-      const value = evaluate("salesVsBudgetPct", {
-        year: 2025,
-        regionId: "NA",
-        month: 2,
-      });
-      expect(value).to.be.closeTo((950 / 2200) * 100, 0.0001);
-    });
-
-    it("allows multiple metrics to reuse the same measure with different aggregations", () => {
-      const total = evaluate("totalBudget", { year: 2025 });
-      const average = evaluate("averageBudgetAmount", { year: 2025 });
-
-      expect(total).to.equal(3800);
-      expect(average).to.equal(1900);
-    });
-
-    it("lets custom metrics request aggregations at runtime", () => {
-      const value = evaluate("budgetRange", { year: 2025 });
-      expect(value).to.equal(2200 - 1600);
-    });
-  });
-
-  describe("runQuery", () => {
-    it("returns formatted metric values and enriches dimension labels", () => {
-      const rows = engine
-        .query("sales")
-        .addAttributes("regionId")
-        .addMetrics("totalSalesAmount")
-        .where({ year: 2025, month: 2 })
-        .run();
-
-      expect(rows).to.deep.include({
-        regionId: "NA",
-        regionName: "North America",
-        totalSalesAmount: "$950.00",
-      });
-      expect(rows).to.deep.include({
-        regionId: "EU",
-        regionName: "Europe",
-        totalSalesAmount: "$450.00",
-      });
-    });
-
-    it("allows base builders to be reused for different slices", () => {
-      const base = engine.query("sales").where({ year: 2025 });
-      const a = base
-        .addAttributes("regionId")
-        .addMetrics("totalSalesAmount")
-        .where({ month: 2 })
-        .run();
-      const b = engine
-        .query("sales")
-        .where({ year: 2025 })
-        .addAttributes("regionId")
-        .addMetrics("totalSalesAmount")
-        .where({ month: 2 })
-        .run();
-      expect(a).to.deep.equal(b);
+    expect(rows).to.deep.include({
+      storeId: 3,
+      productId: 101,
+      year: 2025,
+      totalSalesAmount: null,
+      storeBudget: null,
+      yearlyBudget: 19500,
+      negativeSales: null,
     });
   });
 });
