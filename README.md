@@ -10,7 +10,7 @@ Key capabilities include:
 
 - Unified table metadata covering grains, relationships, and column descriptions.
 - Filter contexts expressed through a concise DSL (`f.eq`, `f.and`, range helpers) that normalize down to LINQ predicates.
-- Scalar metrics for the legacy execution path (`runQuery`) plus **relational metrics** that return `Enumerable<Row>` instances for the new `runRelationalQuery` flow.
+- **Relational metrics** that return `Enumerable<Row>` instances for the `runRelationalQuery` flow, while the legacy scalar builder API remains available through `buildEngine(env)` for backwards compatibility.
 - Relational aggregate + expression metric builders that consume `Enumerable<number>` sequences, ensuring consistent behavior regardless of grain.
 
 Everything is implemented inside [`src/semanticEngine.ts`](src/semanticEngine.ts) with a standalone demo harness in [`src/semanticEngineDemo.ts`](src/semanticEngineDemo.ts) that wires up sample data and relational metrics.
@@ -20,7 +20,7 @@ Everything is implemented inside [`src/semanticEngine.ts`](src/semanticEngine.ts
 | Path | Description |
 | --- | --- |
 | [`src/semanticEngine.ts`](src/semanticEngine.ts) | Core engine, builders (`attr`, `measure`, `relAggregateMetric`, etc.), scalar + relational query execution, and helper utilities. |
-| [`src/semanticEngineDemo.ts`](src/semanticEngineDemo.ts) | Small runnable environment that seeds a store/product dataset and showcases both scalar and relational query execution. |
+| [`src/semanticEngineDemo.ts`](src/semanticEngineDemo.ts) | Small runnable environment that seeds a store/product dataset and showcases relational query execution. |
 | [`src/linq.js`](src/linq.js) / [`src/linq.d.ts`](src/linq.d.ts) | Bundled LINQ runtime plus the TypeScript declaration file used by the engine and tests. |
 | [`src/operators.md`](src/operators.md) | Operator reference for anyone authoring custom LINQ-powered metrics or transforms. |
 | [`test/semanticEngine.test.ts`](test/semanticEngine.test.ts) | Mocha + Chai coverage for filter normalization, measure projection, relational metrics, and the LINQ-only relational executor. |
@@ -37,11 +37,11 @@ Everything is implemented inside [`src/semanticEngine.ts`](src/semanticEngine.ts
    npm test
    ```
    The suite validates `applyContextToTable`, `projectMeasureValues`, relational metric builders, and the `runRelationalQuery` pipeline.
-3. **Try the CLI demo** (optional) to see both execution paths:
+3. **Try the CLI demo** (optional) to see the relational execution path in action:
    ```bash
    npx ts-node src/semanticEngineDemo.ts
    ```
-   The script prints scalar query output and two relational frames (store × product × year and year × month) so you can observe how metrics join back onto the frame.
+   The script prints two relational frames (store × product × year and year × month) so you can observe how metrics join back onto the frame.
 
 ## Using the relational engine
 

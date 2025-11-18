@@ -1174,10 +1174,6 @@ function executeQuery(
   return enriched.toArray();
 }
 
-export function runQuery(env: MetricEvaluationEnvironment, spec: QuerySpec): Row[] {
-  return executeQuery(env, spec);
-}
-
 function dimensionFilterFromRow(
   row: Row,
   attrs: string[]

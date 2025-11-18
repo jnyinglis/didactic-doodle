@@ -7,10 +7,7 @@ import {
   InMemoryDb,
   SemanticModel,
   MetricEvaluationEnvironment,
-  buildEngine,
-  runQuery,
   runRelationalQuery,
-  simpleMetric,
   relAggregateMetric,
   relExpressionMetric,
   attr,
@@ -175,24 +172,6 @@ const demoMeasures: SemanticModel["measures"] = {
 // 5. Metrics
 // -----------------------------------------------------------------------------
 
-// Scalar metrics (work with runQuery / Engine.query)
-const scalarMetrics: SemanticModel["metrics"] = {
-  totalSalesAmountScalar: simpleMetric({
-    name: "totalSalesAmountScalar",
-    measure: "amount",
-    aggregation: "sum",
-    description: "Total sales amount (scalar path)",
-    format: "currency",
-  }),
-  totalBudgetScalar: simpleMetric({
-    name: "totalBudgetScalar",
-    measure: "budgetAmount",
-    aggregation: "sum",
-    description: "Total budget (scalar path)",
-    format: "currency",
-  }),
-};
-
 // Relational metrics (work with runRelationalQuery)
 const relationalMetrics = {
   // Default grain: inherits the frame grain
@@ -232,7 +211,7 @@ const demoModel: SemanticModel = {
   tables: demoTables,
   attributes: demoAttributes,
   measures: demoMeasures,
-  metrics: scalarMetrics,
+  metrics: {},
   relationalMetrics,
   transforms: {}, // no context transforms in this POC
 };
@@ -243,27 +222,7 @@ const demoEnv: MetricEvaluationEnvironment = {
 };
 
 // -----------------------------------------------------------------------------
-// 7. Demo: scalar metric query (existing path)
-// -----------------------------------------------------------------------------
-
-function runScalarDemo() {
-  const engine = buildEngine(demoEnv);
-
-  const spec = engine
-    .query("sales")
-    .addAttributes("year", "month")
-    .addMetrics("totalSalesAmountScalar")
-    .where(f.eq("year", 2025))
-    .build();
-
-  const rows = runQuery(demoEnv, spec);
-
-  console.log("=== Scalar metric demo (group by year, month on sales) ===");
-  console.table(rows);
-}
-
-// -----------------------------------------------------------------------------
-// 8. Demo: relational metric query – frame (store, product, year)
+// 7. Demo: relational metric query – frame (store, product, year)
 // -----------------------------------------------------------------------------
 
 function runRelationalDemoStoreProductYear() {
@@ -284,7 +243,7 @@ function runRelationalDemoStoreProductYear() {
 }
 
 // -----------------------------------------------------------------------------
-// 9. Demo: relational metric query – frame (year, month)
+// 8. Demo: relational metric query – frame (year, month)
 // -----------------------------------------------------------------------------
 
 function runRelationalDemoYearMonth() {
@@ -304,11 +263,10 @@ function runRelationalDemoYearMonth() {
 }
 
 // -----------------------------------------------------------------------------
-// 10. Run all demos when this file is executed directly
+// 9. Run all demos when this file is executed directly
 // -----------------------------------------------------------------------------
 
 function main() {
-  runScalarDemo();
   runRelationalDemoStoreProductYear();
   runRelationalDemoYearMonth();
 }
