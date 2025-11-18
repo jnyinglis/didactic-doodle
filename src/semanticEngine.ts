@@ -527,34 +527,22 @@ function evaluateMeasureDefinition(
     return Number.isNaN(raw) ? null : raw;
   };
 
+  const numericValues = filtered
+    .select((r: Row) => pickValue(r))
+    .where((num: number | null): num is number => typeof num === "number")
+    .memoize();
+
   switch (aggregation) {
     case "sum":
-      return filtered.sum((r: Row) => pickValue(r) ?? 0);
-    case "avg": {
-      const values = filtered
-        .select((r: Row) => pickValue(r))
-        .where((num: number | null): num is number => typeof num === "number")
-        .toArray();
-      if (values.length === 0) return null;
-      const total = values.reduce((a, b) => a + b, 0);
-      return total / values.length;
-    }
+      return numericValues.sum();
+    case "avg":
+      return numericValues.isEmpty() ? null : numericValues.average();
     case "count":
       return filtered.count();
-    case "min": {
-      const values = filtered
-        .select((r: Row) => pickValue(r))
-        .where((num: number | null): num is number => typeof num === "number")
-        .toArray();
-      return values.length === 0 ? null : Math.min(...values);
-    }
-    case "max": {
-      const values = filtered
-        .select((r: Row) => pickValue(r))
-        .where((num: number | null): num is number => typeof num === "number")
-        .toArray();
-      return values.length === 0 ? null : Math.max(...values);
-    }
+    case "min":
+      return numericValues.isEmpty() ? null : numericValues.min();
+    case "max":
+      return numericValues.isEmpty() ? null : numericValues.max();
     default:
       throw new Error(`Unsupported aggregation: ${aggregation}`);
   }
@@ -682,7 +670,7 @@ export function factMeasure(opts: FactMeasureConfig): MetricDefinition {
         factRows = applyContextToTable(factRows, opts.filters, factGrain);
       }
 
-      const values = factRows
+      const numericValues = factRows
         .select((row: Row) => {
           const raw = Number((row as any)[opts.column]);
           return Number.isNaN(raw) ? null : raw;
@@ -690,23 +678,20 @@ export function factMeasure(opts: FactMeasureConfig): MetricDefinition {
         .where(
           (num: number | null): num is number => typeof num === "number"
         )
-        .toArray();
+        .memoize();
 
       const aggregate = opts.aggregate ?? "sum";
       switch (aggregate) {
         case "sum":
-          return values.reduce((acc, value) => acc + value, 0);
-        case "avg": {
-          if (values.length === 0) return null;
-          const total = values.reduce((acc, value) => acc + value, 0);
-          return total / values.length;
-        }
+          return numericValues.sum();
+        case "avg":
+          return numericValues.isEmpty() ? null : numericValues.average();
         case "count":
-          return values.length;
+          return numericValues.count();
         case "min":
-          return values.length === 0 ? null : Math.min(...values);
+          return numericValues.isEmpty() ? null : numericValues.min();
         case "max":
-          return values.length === 0 ? null : Math.max(...values);
+          return numericValues.isEmpty() ? null : numericValues.max();
         default:
           throw new Error(`Unknown aggregate: ${aggregate}`);
       }
@@ -1140,45 +1125,99 @@ function executeQuery(
   if (!tableRows) throw new Error(`Missing rows for table: ${spec.table}`);
 
   const filtered = applyContextToTable(tableRows, spec.filters, tableDef.grain);
-  const groupKeyFn = spec.attributes.length
-    ? (r: Row) => JSON.stringify(pick(r, spec.attributes))
-    : () => "{}";
-  const groups = filtered.groupBy(groupKeyFn).toArray();
-  const cache = new Map<string, number | null>();
-  const result: Row[] = [];
 
-  for (const g of groups) {
-    const keyObj: Row = JSON.parse(g.key());
-    const dimensionFilter: FilterContext = {
-      ...spec.filters,
-      ...keyObj,
+  const frame: RowSequence = spec.attributes.length
+    ? filtered
+        .select((row: Row) => pick(row, spec.attributes))
+        .distinct((row: Row) => keyFromRow(row, spec.attributes))
+    : rowsToEnumerable([{}]);
+
+  const runtime = buildMetricRuntime(env);
+  const cache = new Map<string, number | null>();
+
+  const evaluated = frame.select((dimensionRow: Row) => {
+    const dimensionFilter = dimensionFilterFromRow(
+      dimensionRow,
+      spec.attributes
+    );
+    const metricCtx: MetricContext = {
+      filter: mergeFilters(spec.filters, dimensionFilter),
+      grain: spec.attributes,
     };
-    const rowFilter = dimensionFilter;
 
     const metricValues: Row = {};
     for (const metricName of spec.metrics) {
-      const numericValue = evaluateMetric(
+      const metric = env.model.metrics[metricName];
+      if (!metric) {
+        throw new Error(`Unknown metric: ${metricName}`);
+      }
+      const numericValue = evaluateMetricWithRuntime(
         metricName,
+        metricCtx,
+        runtime,
         env,
-        { filter: rowFilter },
         cache
       );
-      const def = env.model.metrics[metricName];
-      metricValues[metricName] = formatValue(numericValue, def?.format);
+      metricValues[metricName] = formatValue(numericValue, metric?.format);
     }
 
-    const dimPart = enrichDimensions(keyObj, env.db, env.model.tables);
-    result.push({
-      ...dimPart,
+    return {
+      ...dimensionRow,
       ...metricValues,
-    });
-  }
+    };
+  });
 
-  return result;
+  const enriched = evaluated.select((row: Row) =>
+    enrichDimensions(row, env.db, env.model.tables)
+  );
+
+  return enriched.toArray();
 }
 
 export function runQuery(env: MetricEvaluationEnvironment, spec: QuerySpec): Row[] {
   return executeQuery(env, spec);
+}
+
+function dimensionFilterFromRow(
+  row: Row,
+  attrs: string[]
+): FilterContext | undefined {
+  if (attrs.length === 0) return undefined;
+  const expressions = attrs
+    .map((attr) => {
+      if (!(attr in row)) {
+        return undefined;
+      }
+      return f.eq(attr, row[attr] as FilterPrimitive);
+    })
+    .filter((expr): expr is FilterExpression => Boolean(expr));
+
+  if (expressions.length === 0) return undefined;
+  return expressions.length === 1 ? expressions[0] : f.and(...expressions);
+}
+
+function evaluateMetricWithRuntime(
+  metricName: string,
+  ctx: MetricContext,
+  runtime: MetricRuntime,
+  env: MetricEvaluationEnvironment,
+  cache: Map<string, number | null>
+): number | null {
+  const metric = env.model.metrics[metricName];
+  if (!metric) {
+    throw new Error(`Unknown metric: ${metricName}`);
+  }
+  const effectiveContext: MetricContext = {
+    filter: ctx.filter,
+    grain: ctx.grain ?? metric.grain,
+  };
+  const key = metricCacheKey(metricName, effectiveContext);
+  if (cache.has(key)) {
+    return cache.get(key)!;
+  }
+  const value = metric.eval(effectiveContext, runtime);
+  cache.set(key, value);
+  return value;
 }
 
 /**
@@ -1220,7 +1259,9 @@ export function buildFrameEnumerable(
   env: MetricEvaluationEnvironment
 ): RowSequence {
   const domains = inferAttributeDomains(spec, env.model);
-  if (domains.length === 0) return rowsToEnumerable([]);
+  if (domains.length === 0) {
+    return rowsToEnumerable([{}]);
+  }
 
   const domainEnumerables = domains.map((domain) => {
     const tableRows: Row[] = env.db.tables[domain.table] ?? [];
@@ -1291,15 +1332,12 @@ export function runRelationalQuery(
           : baseContext.grain,
     };
 
-    const metricRows = metric
-      .evalEnumerable(metricCtx, env)
-      .toArray();
-    const metricRel = rowsToEnumerable(metricRows);
+    const metricRel = metric.evalEnumerable(metricCtx, env);
     const joinAttrs = Array.isArray(metricCtx.grain) ? metricCtx.grain : [];
 
     if (joinAttrs.length === 0) {
       // Global metric: repeat scalar across all frame rows
-      const sample = metricRows[0];
+      const sample = metricRel.firstOrDefault();
       const val = sample ? (sample as any)[metric.name] : null;
       result = result.select((r: Row) => ({
         ...r,
