@@ -19,6 +19,18 @@ export type RowSequence = Enumerable.IEnumerable<Row>;
 
 export type NumberSequence = Enumerable.IEnumerable<number>;
 
+/**
+ * Declarative specification for table-based transforms.
+ */
+export type TableTransform = {
+  id: string;
+  relation: () => RowSequence;
+  anchorAttr: string;
+  fromColumn: string;
+  toColumn: string;
+  factKey: string;
+};
+
 /* --------------------------------------------------------------------------
  * TABLE + ATTRIBUTE + MEASURE DEFINITIONS
  * -------------------------------------------------------------------------- */
@@ -356,6 +368,77 @@ export function applyContextToTable(
   return sequence.where((r: Row) => evaluateFilterNode(pruned, r));
 }
 
+/**
+ * Join the current context rows through the transform relation to determine
+ * the fact keys that should be included, then filter the fact rows.
+ */
+export function applyTableTransform(
+  contextRows: RowSequence,
+  factRows: RowSequence,
+  transform: TableTransform
+): RowSequence {
+  const transformRows = transform.relation();
+
+  const targetKeys = contextRows
+    .join(
+      transformRows,
+      (ctx) => ctx[transform.anchorAttr],
+      (tr) => tr[transform.fromColumn],
+      (_ctx, tr) => tr[transform.toColumn]
+    )
+    .distinct()
+    .toArray();
+
+  if (!targetKeys.length) {
+    return Enumerable.empty<Row>();
+  }
+
+  const keySet = new Set(targetKeys);
+  return factRows.where((row) => keySet.has(row[transform.factKey]));
+}
+
+function buildContextRowsForTransform(
+  ctx: MetricContext,
+  transform: TableTransform
+): RowSequence {
+  const anchorValue = getFilterValue(transform.anchorAttr, ctx);
+
+  if (Array.isArray(anchorValue)) {
+    const rows = (anchorValue as FilterPrimitive[]).map((value) => ({
+      [transform.anchorAttr]: value,
+    }));
+    return rowsToEnumerable(rows);
+  }
+
+  if (anchorValue === undefined) {
+    const anchors = transform
+      .relation()
+      .select((row: Row) => row[transform.fromColumn])
+      .distinct((value: any) => JSON.stringify(value))
+      .toArray();
+
+    return rowsToEnumerable(
+      anchors.map((value) => ({ [transform.anchorAttr]: value }))
+    );
+  }
+
+  if (
+    anchorValue !== null &&
+    typeof anchorValue === "object" &&
+    "kind" in anchorValue
+  ) {
+    throw new Error(
+      `Table transform ${transform.id} requires equality filters for ${transform.anchorAttr}`
+    );
+  }
+
+  return rowsToEnumerable([
+    {
+      [transform.anchorAttr]: anchorValue,
+    },
+  ]);
+}
+
 function serializeFilter(filter?: FilterContext): any {
   if (!filter) return null;
   if ("kind" in (filter as any)) return filter;
@@ -496,7 +579,10 @@ export function projectMeasureValues(
     throw new Error(`Unknown table: ${def.table}`);
   }
   const rows = rowsToEnumerable(env.db.tables[def.table] ?? []);
-  const grain = ctx.grain ?? def.grain ?? tableDef.grain;
+  const grain =
+    ctx.grain && ctx.grain.length > 0
+      ? ctx.grain
+      : def.grain ?? tableDef.grain;
   const filtered = applyContextToTable(rows, ctx.filter, grain);
   const column = def.column ?? def.name;
 
@@ -532,6 +618,18 @@ interface SimpleMetricOptions {
   grain?: string[];
 }
 
+export interface FactMeasureConfig {
+  name: string;
+  factTable: string;
+  column: string;
+  aggregate?: AggregationOperator;
+  description?: string;
+  format?: string;
+  grain?: string[];
+  filters?: FilterContext;
+  transform?: TableTransform;
+}
+
 export function simpleMetric(opts: SimpleMetricOptions): MetricDefinition {
   return {
     name: opts.name,
@@ -546,8 +644,74 @@ export function simpleMetric(opts: SimpleMetricOptions): MetricDefinition {
   };
 }
 
-export function factMeasure(opts: SimpleMetricOptions): MetricDefinition {
-  return simpleMetric(opts);
+export function factMeasure(opts: FactMeasureConfig): MetricDefinition {
+  return {
+    name: opts.name,
+    description: opts.description,
+    format: opts.format,
+    grain: opts.grain,
+    aggregation: opts.aggregate,
+    eval: (ctx, runtime) => {
+      const env = runtime.env;
+      const tableDef = env.model.tables[opts.factTable];
+      if (!tableDef) {
+        throw new Error(`Unknown table for fact measure: ${opts.factTable}`);
+      }
+
+      const factRowsRaw = env.db.tables[opts.factTable] ?? [];
+      const factGrain = tableDef.grain;
+      let factRows = rowsToEnumerable(factRowsRaw);
+
+      const filterGrain = (() => {
+        if (!opts.transform) return factGrain;
+        const excluded = new Set<string>([
+          opts.transform.anchorAttr,
+          opts.transform.factKey,
+        ]);
+        return factGrain.filter((attr) => !excluded.has(attr));
+      })();
+
+      factRows = applyContextToTable(factRows, ctx.filter, filterGrain);
+
+      if (opts.transform) {
+        const contextRows = buildContextRowsForTransform(ctx, opts.transform);
+        factRows = applyTableTransform(contextRows, factRows, opts.transform);
+      }
+
+      if (opts.filters) {
+        factRows = applyContextToTable(factRows, opts.filters, factGrain);
+      }
+
+      const values = factRows
+        .select((row: Row) => {
+          const raw = Number((row as any)[opts.column]);
+          return Number.isNaN(raw) ? null : raw;
+        })
+        .where(
+          (num: number | null): num is number => typeof num === "number"
+        )
+        .toArray();
+
+      const aggregate = opts.aggregate ?? "sum";
+      switch (aggregate) {
+        case "sum":
+          return values.reduce((acc, value) => acc + value, 0);
+        case "avg": {
+          if (values.length === 0) return null;
+          const total = values.reduce((acc, value) => acc + value, 0);
+          return total / values.length;
+        }
+        case "count":
+          return values.length;
+        case "min":
+          return values.length === 0 ? null : Math.min(...values);
+        case "max":
+          return values.length === 0 ? null : Math.max(...values);
+        default:
+          throw new Error(`Unknown aggregate: ${aggregate}`);
+      }
+    },
+  };
 }
 
 export function expressionMetric(opts: {
