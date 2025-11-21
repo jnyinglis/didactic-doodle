@@ -3,13 +3,18 @@
 // POC/demo setup for the relational semantic engine in semanticEngine.ts
 
 import {
-  Row,
   InMemoryDb,
   SemanticModel,
   MetricEvaluationEnvironment,
+  LogicalAttribute,
+  SemanticModelV2,
+  QuerySpecV2,
   runRelationalQuery,
   relAggregateMetric,
   relExpressionMetric,
+  aggregateMetric,
+  rowsetTransformMetric,
+  runSemanticQuery,
   attr,
   measure,
   f,
@@ -32,20 +37,34 @@ const demoDb: InMemoryDb = {
     date_dim: [
       { year: 2025, month: 1 },
       { year: 2025, month: 2 },
+      { year: 2024, month: 1 },
+      { year: 2024, month: 2 },
     ],
     sales: [
-      // store 1, product 100
+      // store 1, product 100 (2025)
       { storeId: 1, productId: 100, year: 2025, month: 1, amount: 150 },
       { storeId: 1, productId: 100, year: 2025, month: 2, amount: 200 },
-      // store 1, product 101
+      // store 1, product 101 (2025)
       { storeId: 1, productId: 101, year: 2025, month: 1, amount: 300 },
       { storeId: 1, productId: 101, year: 2025, month: 2, amount: 250 },
-      // store 2, product 100
+      // store 2, product 100 (2025)
       { storeId: 2, productId: 100, year: 2025, month: 1, amount: 120 },
       { storeId: 2, productId: 100, year: 2025, month: 2, amount: 180 },
-      // store 2, product 101
+      // store 2, product 101 (2025)
       { storeId: 2, productId: 101, year: 2025, month: 1, amount: 220 },
       { storeId: 2, productId: 101, year: 2025, month: 2, amount: 260 },
+      // store 1, product 100 (2024)
+      { storeId: 1, productId: 100, year: 2024, month: 1, amount: 80 },
+      { storeId: 1, productId: 100, year: 2024, month: 2, amount: 90 },
+      // store 1, product 101 (2024)
+      { storeId: 1, productId: 101, year: 2024, month: 1, amount: 120 },
+      { storeId: 1, productId: 101, year: 2024, month: 2, amount: 110 },
+      // store 2, product 100 (2024)
+      { storeId: 2, productId: 100, year: 2024, month: 1, amount: 50 },
+      { storeId: 2, productId: 100, year: 2024, month: 2, amount: 60 },
+      // store 2, product 101 (2024)
+      { storeId: 2, productId: 101, year: 2024, month: 1, amount: 55 },
+      { storeId: 2, productId: 101, year: 2024, month: 2, amount: 65 },
     ],
     budget: [
       // yearly budgets per store/product
@@ -54,11 +73,12 @@ const demoDb: InMemoryDb = {
       { storeId: 2, productId: 100, year: 2025, budgetAmount: 4000 },
       { storeId: 2, productId: 101, year: 2025, budgetAmount: 4500 },
     ],
+    year_shift: [{ currentYear: 2025, lastYear: 2024 }],
   },
 };
 
 // -----------------------------------------------------------------------------
-// 2. Table definitions
+// 2. Table definitions (relational metrics)
 // -----------------------------------------------------------------------------
 
 const demoTables: SemanticModel["tables"] = {
@@ -123,7 +143,7 @@ const demoTables: SemanticModel["tables"] = {
 };
 
 // -----------------------------------------------------------------------------
-// 3. Attribute registry
+// 3. Attribute registry (relational metrics)
 // -----------------------------------------------------------------------------
 
 const demoAttributes: SemanticModel["attributes"] = {
@@ -148,7 +168,7 @@ const demoAttributes: SemanticModel["attributes"] = {
 };
 
 // -----------------------------------------------------------------------------
-// 4. Measures
+// 4. Measures (relational metrics)
 // -----------------------------------------------------------------------------
 
 const demoMeasures: SemanticModel["measures"] = {
@@ -169,7 +189,7 @@ const demoMeasures: SemanticModel["measures"] = {
 };
 
 // -----------------------------------------------------------------------------
-// 5. Metrics
+// 5. Relational metrics
 // -----------------------------------------------------------------------------
 
 // Relational metrics (work with runRelationalQuery)
@@ -204,10 +224,10 @@ const relationalMetrics = {
 };
 
 // -----------------------------------------------------------------------------
-// 6. Semantic model + environment
+// 6. Semantic model + environment (relational metrics)
 // -----------------------------------------------------------------------------
 
-const demoModel: SemanticModel = {
+const relationalModel: SemanticModel = {
   tables: demoTables,
   attributes: demoAttributes,
   measures: demoMeasures,
@@ -216,13 +236,105 @@ const demoModel: SemanticModel = {
   transforms: {}, // no context transforms in this POC
 };
 
-const demoEnv: MetricEvaluationEnvironment = {
-  model: demoModel,
+const relationalEnv: MetricEvaluationEnvironment = {
+  model: relationalModel,
   db: demoDb,
 };
 
 // -----------------------------------------------------------------------------
-// 7. Demo: relational metric query – frame (store, product, year)
+// 7. Grain-agnostic semantic DSL setup
+// -----------------------------------------------------------------------------
+
+const logicalAttributes: Record<string, LogicalAttribute> = {
+  storeId: {
+    name: "storeId",
+    relation: "sales",
+    column: "storeId",
+    defaultFact: "sales",
+  },
+  storeName: {
+    name: "storeName",
+    relation: "store_dim",
+    column: "storeName",
+    defaultFact: "sales",
+  },
+  productId: {
+    name: "productId",
+    relation: "sales",
+    column: "productId",
+    defaultFact: "sales",
+  },
+  productName: {
+    name: "productName",
+    relation: "product_dim",
+    column: "productName",
+    defaultFact: "sales",
+  },
+  year: { name: "year", relation: "sales", column: "year", defaultFact: "sales" },
+  month: {
+    name: "month",
+    relation: "sales",
+    column: "month",
+    defaultFact: "sales",
+  },
+  amount: {
+    name: "amount",
+    relation: "sales",
+    column: "amount",
+    defaultFact: "sales",
+  },
+};
+
+const rowsetTransforms = {
+  LastYear: {
+    id: "LastYear",
+    table: "year_shift",
+    anchorAttr: "year",
+    fromColumn: "currentYear",
+    toColumn: "lastYear",
+    factKey: "year",
+  },
+};
+
+const semanticMetrics = {
+  totalSales: aggregateMetric("totalSales", "amount", "sum"),
+  avgSale: aggregateMetric("avgSale", "amount", "avg"),
+  lastYearSales: rowsetTransformMetric({
+    name: "lastYearSales",
+    baseMetric: "totalSales",
+    transformId: "LastYear",
+  }),
+  salesDelta: {
+    name: "salesDelta",
+    deps: ["totalSales", "lastYearSales"],
+    eval: ({ evalMetric }) => {
+      const current = evalMetric("totalSales") ?? 0;
+      const lastYear = evalMetric("lastYearSales") ?? 0;
+      return current - lastYear;
+    },
+  },
+};
+
+const semanticModel: SemanticModelV2 = {
+  facts: { sales: { name: "sales" } },
+  dimensions: {
+    store_dim: { name: "store_dim" },
+    product_dim: { name: "product_dim" },
+    date_dim: { name: "date_dim" },
+  },
+  attributes: logicalAttributes,
+  joins: [
+    { fact: "sales", dimension: "store_dim", factKey: "storeId", dimensionKey: "storeId" },
+    { fact: "sales", dimension: "product_dim", factKey: "productId", dimensionKey: "productId" },
+  ],
+  metricsV2: semanticMetrics,
+  rowsetTransforms,
+};
+
+const semanticEnv: MetricEvaluationEnvironment = { model: semanticModel as any, db: demoDb };
+
+// -----------------------------------------------------------------------------
+// 8. Demo: relational metric query – frame (store, product, year)
 // -----------------------------------------------------------------------------
 
 function runRelationalDemoStoreProductYear() {
@@ -234,7 +346,7 @@ function runRelationalDemoStoreProductYear() {
     filters: f.eq("year", 2025),
   };
 
-  const rows = runRelationalQuery(demoEnv, spec as any);
+  const rows = runRelationalQuery(relationalEnv, spec as any);
 
   console.log(
     "=== Relational demo (frame = store × product × year; metrics joined) ==="
@@ -243,7 +355,7 @@ function runRelationalDemoStoreProductYear() {
 }
 
 // -----------------------------------------------------------------------------
-// 8. Demo: relational metric query – frame (year, month)
+// 9. Demo: relational metric query – frame (year, month)
 // -----------------------------------------------------------------------------
 
 function runRelationalDemoYearMonth() {
@@ -254,7 +366,7 @@ function runRelationalDemoYearMonth() {
     filters: f.eq("year", 2025),
   };
 
-  const rows = runRelationalQuery(demoEnv, spec as any);
+  const rows = runRelationalQuery(relationalEnv, spec as any);
 
   console.log(
     "=== Relational demo (frame = year × month; totalSalesAmount joined) ==="
@@ -263,12 +375,32 @@ function runRelationalDemoYearMonth() {
 }
 
 // -----------------------------------------------------------------------------
-// 9. Run all demos when this file is executed directly
+// 10. Demo: grain-agnostic semantic DSL – frame (store, year)
+// -----------------------------------------------------------------------------
+
+function runSemanticDslDemo() {
+  const spec: QuerySpecV2 = {
+    dimensions: ["storeId", "year"],
+    metrics: ["totalSales", "avgSale", "lastYearSales", "salesDelta"],
+    where: f.eq("year", 2025),
+  };
+
+  const rows = runSemanticQuery(semanticEnv, semanticModel, spec);
+
+  console.log(
+    "=== Semantic DSL demo (frame = store × year; grain-agnostic metrics) ==="
+  );
+  console.table(rows);
+}
+
+// -----------------------------------------------------------------------------
+// 11. Run all demos when this file is executed directly
 // -----------------------------------------------------------------------------
 
 function main() {
   runRelationalDemoStoreProductYear();
   runRelationalDemoYearMonth();
+  runSemanticDslDemo();
 }
 
 main();
