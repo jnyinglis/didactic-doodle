@@ -1224,3 +1224,450 @@ function enrichDimensions(
   // Currently returns the row unchanged.
   return row;
 }
+
+/* --------------------------------------------------------------------------
+ * GRAIN-AGNOSTIC DSL (PLAN-ALIGNED IMPLEMENTATION)
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Logical attribute definition that maps a semantic name to a concrete
+ * relation/column and declares which fact it is reachable from by default.
+ */
+export interface LogicalAttribute {
+  name: string;
+  relation: string; // table name where the column lives
+  column: string;
+  defaultFact: string; // base fact that can reach this attribute
+}
+
+export interface FactRelation {
+  name: string;
+}
+
+export interface JoinEdge {
+  fact: string;
+  dimension: string;
+  factKey: string;
+  dimensionKey: string;
+}
+
+export interface SemanticModelV2 {
+  facts: Record<string, FactRelation>;
+  dimensions: Record<string, { name: string }>;
+  attributes: Record<string, LogicalAttribute>;
+  joins: JoinEdge[];
+  metricsV2: MetricRegistryV2;
+  rowsetTransforms?: Record<string, RowsetTransformDefinition>;
+}
+
+export interface RowsetTransformDefinition {
+  id: string;
+  table: string;
+  anchorAttr: string;
+  fromColumn: string;
+  toColumn: string;
+  factKey: string;
+}
+
+export type MetricEvalV2 = (
+  ctx: MetricComputationContext
+) => number | undefined;
+
+export interface MetricComputationHelpers {
+  runtime: MetricRuntimeV2;
+  applyRowsetTransform(
+    transformId: string,
+    groupKey: Record<string, any>
+  ): RowSequence;
+}
+
+export interface MetricComputationContext {
+  rows: RowSequence;
+  groupKey: Record<string, any>;
+  evalMetric: (name: string) => number | undefined;
+  helpers: MetricComputationHelpers;
+}
+
+export interface MetricDefinitionV2 {
+  name: string;
+  description?: string;
+  baseFact?: string;
+  attributes?: string[];
+  deps?: string[];
+  eval: MetricEvalV2;
+}
+
+export type MetricRegistryV2 = Record<string, MetricDefinitionV2>;
+
+export interface QuerySpecV2 {
+  dimensions: string[];
+  metrics: string[];
+  where?: FilterContext;
+  having?: (values: Record<string, number | undefined>) => boolean;
+  baseFact?: string;
+}
+
+export interface MetricRuntimeV2 {
+  model: SemanticModelV2;
+  db: InMemoryDb;
+  baseFact: string;
+  whereFilter: FilterNode | null;
+  baseRelation: RowSequence;
+  filteredRelation: RowSequence;
+  groupDimensions: string[];
+}
+
+function normalizeAttribute(def: LogicalAttribute): LogicalAttribute {
+  return {
+    ...def,
+    column: def.column ?? def.name,
+  };
+}
+
+function attributesForRelation(
+  relation: string,
+  attributes: Record<string, LogicalAttribute>
+): LogicalAttribute[] {
+  return Object.values(attributes)
+    .map(normalizeAttribute)
+    .filter((a) => a.relation === relation);
+}
+
+function collectFilterFields(ctx?: FilterContext): Set<string> {
+  const node = normalizeFilterContext(ctx);
+  const fields = new Set<string>();
+  if (!node) return fields;
+  const walk = (n: FilterNode) => {
+    if (n.kind === "expression") {
+      fields.add(n.field);
+    } else {
+      n.filters.forEach(walk);
+    }
+  };
+  walk(node);
+  return fields;
+}
+
+function buildJoinLookup(edges: JoinEdge[]): Map<string, JoinEdge> {
+  const map = new Map<string, JoinEdge>();
+  edges.forEach((edge) => {
+    map.set(`${edge.fact}|${edge.dimension}`, edge);
+  });
+  return map;
+}
+
+function mapLogicalAttributes(
+  row: Row,
+  relation: string,
+  attrRegistry: Record<string, LogicalAttribute>,
+  needed: Set<string>
+): Row {
+  const attrs = attributesForRelation(relation, attrRegistry);
+  const mapped: Row = {};
+  for (const attr of attrs) {
+    const logical = attr.name;
+    if (needed.size && !needed.has(logical)) continue;
+    mapped[logical] = (row as any)[attr.column];
+  }
+  return mapped;
+}
+
+function buildBaseRelation(
+  model: SemanticModelV2,
+  db: InMemoryDb,
+  baseFact: string,
+  requiredAttributes: Set<string>
+): { base: RowSequence; joined: RowSequence } {
+  const joinLookup = buildJoinLookup(model.joins);
+  const factRows = rowsToEnumerable(db.tables[baseFact] ?? []);
+
+  const factProjected = factRows.select((row: Row) => ({
+    ...mapLogicalAttributes(row, baseFact, model.attributes, requiredAttributes),
+  }));
+
+  const neededRelations = new Set<string>();
+  for (const attr of requiredAttributes) {
+    const def = model.attributes[attr];
+    if (!def) continue;
+    if (def.relation !== baseFact) {
+      neededRelations.add(def.relation);
+    }
+  }
+
+  let joined: RowSequence = factProjected;
+
+  neededRelations.forEach((relation) => {
+    const join = joinLookup.get(`${baseFact}|${relation}`);
+    if (!join) {
+      throw new Error(
+        `No join defined from fact ${baseFact} to dimension ${relation}`
+      );
+    }
+    const dimensionRows = rowsToEnumerable(db.tables[relation] ?? []);
+    const mappedDimension = dimensionRows.select((row: Row) => ({
+      __joinKey: (row as any)[join.dimensionKey],
+      ...mapLogicalAttributes(row, relation, model.attributes, requiredAttributes),
+    }));
+
+    joined = joined.selectMany((factRow: Row) => {
+      const joinKey = (factRow as any)[join.factKey];
+      const matches = mappedDimension
+        .where((d: Row) => d.__joinKey === joinKey)
+        .toArray();
+      if (!matches.length) return [factRow];
+      return matches.map((d) => {
+        const { __joinKey, ...rest } = d;
+        return { ...factRow, ...rest };
+      });
+    });
+  });
+
+  return { base: factProjected, joined };
+}
+
+function applyWhereFilter(
+  relation: RowSequence,
+  where?: FilterContext,
+  availableAttrs: string[] = []
+): RowSequence {
+  if (!where) return relation;
+  const allowed = new Set(availableAttrs);
+  const pruned = pruneFilterNode(normalizeFilterContext(where)!, allowed);
+  if (!pruned) return relation;
+  return relation.where((row: Row) => evaluateFilterNode(pruned, row));
+}
+
+function keyFromGroup(groupKey: Record<string, any>): string {
+  return JSON.stringify(groupKey);
+}
+
+function aggregate(
+  rows: RowSequence,
+  attr: string,
+  op: AggregationOperator
+): number | undefined {
+  const values = rows
+    .select((r: Row) => Number((r as any)[attr]))
+    .where((num: number) => !Number.isNaN(num))
+    .toArray();
+
+  if (values.length === 0) return undefined;
+
+  switch (op) {
+    case "sum":
+      return values.reduce((a, b) => a + b, 0);
+    case "avg":
+      return values.reduce((a, b) => a + b, 0) / values.length;
+    case "min":
+      return Math.min(...values);
+    case "max":
+      return Math.max(...values);
+    case "count":
+      return values.length;
+    default:
+      return undefined;
+  }
+}
+
+export function aggregateMetric(
+  name: string,
+  attr: string,
+  op: AggregationOperator = "sum"
+): MetricDefinitionV2 {
+  return {
+    name,
+    attributes: [attr],
+    eval: ({ rows }) => aggregate(rows, attr, op),
+  };
+}
+
+export function rowsetTransformMetric(opts: {
+  name: string;
+  baseMetric: string;
+  transformId: string;
+  description?: string;
+}): MetricDefinitionV2 {
+  return {
+    name: opts.name,
+    deps: [opts.baseMetric],
+    description: opts.description,
+    eval: (ctx) => {
+      const transformedRows = ctx.helpers.applyRowsetTransform(
+        opts.transformId,
+        ctx.groupKey
+      );
+      const cacheLabel = `${opts.name}:transform`;
+      const value = evaluateMetricV2(
+        opts.baseMetric,
+        ctx.helpers.runtime,
+        ctx.groupKey,
+        transformedRows,
+        cacheLabel
+      );
+      return value;
+    },
+  };
+}
+
+function applyRowsetTransform(
+  runtime: MetricRuntimeV2,
+  transformId: string,
+  groupKey: Record<string, any>
+): RowSequence {
+  const transform = runtime.model.rowsetTransforms?.[transformId];
+  if (!transform) {
+    throw new Error(`Unknown rowset transform: ${transformId}`);
+  }
+
+  const anchorValue = groupKey[transform.anchorAttr];
+  const transformRows = rowsToEnumerable(
+    runtime.db.tables[transform.table] ?? []
+  );
+
+  const targetAnchors = transformRows
+    .where((r: Row) => (r as any)[transform.fromColumn] === anchorValue)
+    .select((r: Row) => (r as any)[transform.toColumn])
+    .distinct()
+    .toArray();
+
+  if (!targetAnchors.length) return rowsToEnumerable([]);
+
+  const allowedAnchor = new Set(targetAnchors);
+
+  // Apply where filter minus the anchor attribute so other predicates remain.
+  const availableAttrs = runtime.groupDimensions.filter(
+    (d) => d !== transform.anchorAttr
+  );
+  const filterMinusAnchor = runtime.whereFilter
+    ? pruneFilterNode(runtime.whereFilter, new Set(availableAttrs))
+    : null;
+
+  const startingRows = filterMinusAnchor
+    ? runtime.baseRelation.where((r: Row) => evaluateFilterNode(filterMinusAnchor, r))
+    : runtime.baseRelation;
+
+  return startingRows.where((row: Row) => {
+    if (!allowedAnchor.has((row as any)[transform.factKey])) return false;
+    return runtime.groupDimensions.every((dim) => {
+      if (dim === transform.anchorAttr) return true;
+      return (row as any)[dim] === groupKey[dim];
+    });
+  });
+}
+
+function evaluateMetricV2(
+  metricName: string,
+  runtime: MetricRuntimeV2,
+  groupKey: Record<string, any>,
+  rows: RowSequence,
+  cacheLabel?: string,
+  cache?: Map<string, number | undefined>
+): number | undefined {
+  const registry = runtime.model.metricsV2;
+  const metric = registry[metricName];
+  if (!metric) {
+    throw new Error(`Unknown metric: ${metricName}`);
+  }
+
+  const cacheKey = `${metricName}|${cacheLabel ?? "base"}|${keyFromGroup(
+    groupKey
+  )}`;
+  const workingCache = cache ?? new Map<string, number | undefined>();
+  if (workingCache.has(cacheKey)) {
+    return workingCache.get(cacheKey);
+  }
+
+  const evalMetric = (dep: string) =>
+    evaluateMetricV2(dep, runtime, groupKey, rows, undefined, workingCache);
+
+  const helpers: MetricComputationHelpers = {
+    runtime,
+    applyRowsetTransform: (transformId, gk) =>
+      applyRowsetTransform(runtime, transformId, gk),
+  };
+
+  const value = metric.eval({ rows, groupKey, evalMetric, helpers });
+  workingCache.set(cacheKey, value);
+  return value;
+}
+
+export function runSemanticQuery(
+  env: MetricEvaluationEnvironment,
+  model: SemanticModelV2,
+  spec: QuerySpecV2
+): Row[] {
+  const dimensions = spec.dimensions;
+  const whereFields = collectFilterFields(spec.where);
+  const metricAttrFields = new Set<string>();
+
+  spec.metrics.forEach((m) => {
+    const def = model.metricsV2[m];
+    def?.attributes?.forEach((a) => metricAttrFields.add(a));
+  });
+
+  const requiredAttrs = new Set<string>([...dimensions]);
+  whereFields.forEach((f) => requiredAttrs.add(f));
+  metricAttrFields.forEach((f) => requiredAttrs.add(f));
+
+  const baseFact =
+    spec.baseFact ??
+    spec.metrics
+      .map((m) => model.metricsV2[m]?.baseFact)
+      .find((f) => !!f) ??
+    [...requiredAttrs]
+      .map((attr) => model.attributes[attr]?.defaultFact)
+      .find((f) => !!f);
+
+  if (!baseFact) {
+    throw new Error("Unable to determine a base fact for the query");
+  }
+
+  const { base, joined } = buildBaseRelation(
+    model,
+    env.db,
+    baseFact,
+    requiredAttrs
+  );
+
+  const whereNode = normalizeFilterContext(spec.where);
+  const filtered = applyWhereFilter(joined, spec.where, Array.from(requiredAttrs));
+
+  const runtime: MetricRuntimeV2 = {
+    model,
+    db: env.db,
+    baseFact,
+    baseRelation: base,
+    filteredRelation: filtered,
+    whereFilter: whereNode,
+    groupDimensions: dimensions,
+  };
+
+  const grouped = filtered.groupBy(
+    (row: Row) => keyFromRow(row, dimensions),
+    (row: Row) => row
+  );
+
+  const results: Row[] = [];
+
+  grouped.forEach((group) => {
+    const sample = group.first();
+    const groupKey: Record<string, any> = {};
+    if (sample) {
+      dimensions.forEach((d) => (groupKey[d] = (sample as any)[d]));
+    }
+
+    const metricCache = new Map<string, number | undefined>();
+    const metricValues: Record<string, number | undefined> = {};
+    spec.metrics.forEach((m) => {
+      metricValues[m] = evaluateMetricV2(m, runtime, groupKey, group, undefined, metricCache);
+    });
+
+    if (spec.having && !spec.having(metricValues)) {
+      return;
+    }
+
+    results.push({ ...groupKey, ...metricValues });
+  });
+
+  return results;
+}

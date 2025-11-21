@@ -1,269 +1,173 @@
 import { expect } from "chai";
 import {
-  attr,
-  evaluateMetric,
-  f,
-  factMeasure,
+  aggregateMetric,
   InMemoryDb,
-  measure,
+  LogicalAttribute,
+  MetricDefinitionV2,
   MetricEvaluationEnvironment,
-  relAggregateMetric,
-  relExpressionMetric,
-  RelationalMetricRegistry,
-  runRelationalQuery,
-  SemanticModel,
-  TableTransform,
-  projectMeasureValues,
-  rowsToEnumerable,
+  MetricRegistryV2,
+  QuerySpecV2,
+  RowsetTransformDefinition,
+  SemanticModelV2,
+  runSemanticQuery,
+  rowsetTransformMetric,
+  f,
 } from "../src/semanticEngine";
 
-const demoDb: InMemoryDb = {
+const db: InMemoryDb = {
   tables: {
+    sales: [
+      { storeId: 1, year: 2025, month: 1, amount: 150 },
+      { storeId: 1, year: 2025, month: 2, amount: 200 },
+      { storeId: 2, year: 2025, month: 1, amount: 300 },
+      { storeId: 2, year: 2025, month: 2, amount: 100 },
+      { storeId: 1, year: 2024, month: 1, amount: 80 },
+      { storeId: 1, year: 2024, month: 2, amount: 90 },
+      { storeId: 2, year: 2024, month: 1, amount: 50 },
+      { storeId: 2, year: 2024, month: 2, amount: 60 },
+    ],
     store_dim: [
       { storeId: 1, storeName: "Downtown" },
-      { storeId: 2, storeName: "Airport" },
-      { storeId: 3, storeName: "Mall" }, // no sales/budget rows on purpose
+      { storeId: 2, storeName: "Mall" },
     ],
-    product_dim: [
-      { productId: 100, productName: "Widget" },
-      { productId: 101, productName: "Gadget" },
-    ],
-    date_dim: [
-      { year: 2025, month: 1 },
-      { year: 2025, month: 2 },
-    ],
-    sales: [
-      { storeId: 1, productId: 100, year: 2025, month: 1, amount: 150 },
-      { storeId: 1, productId: 100, year: 2025, month: 2, amount: 200 },
-      { storeId: 1, productId: 101, year: 2025, month: 1, amount: 300 },
-      { storeId: 1, productId: 101, year: 2025, month: 2, amount: 250 },
-      { storeId: 2, productId: 100, year: 2025, month: 1, amount: 120 },
-      { storeId: 2, productId: 100, year: 2025, month: 2, amount: 180 },
-      { storeId: 2, productId: 101, year: 2025, month: 1, amount: 220 },
-      { storeId: 2, productId: 101, year: 2025, month: 2, amount: 260 },
-      // prior year rows for transform coverage
-      { storeId: 1, productId: 100, year: 2024, month: 1, amount: 90 },
-      { storeId: 1, productId: 100, year: 2024, month: 2, amount: 110 },
-      { storeId: 1, productId: 101, year: 2024, month: 1, amount: 130 },
-      { storeId: 1, productId: 101, year: 2024, month: 2, amount: 170 },
-      { storeId: 2, productId: 100, year: 2024, month: 1, amount: 80 },
-      { storeId: 2, productId: 100, year: 2024, month: 2, amount: 95 },
-      { storeId: 2, productId: 101, year: 2024, month: 1, amount: 140 },
-      { storeId: 2, productId: 101, year: 2024, month: 2, amount: 160 },
-    ],
-    budget: [
-      { storeId: 1, productId: 100, year: 2025, budgetAmount: 5000 },
-      { storeId: 1, productId: 101, year: 2025, budgetAmount: 6000 },
-      { storeId: 2, productId: 100, year: 2025, budgetAmount: 4000 },
-      { storeId: 2, productId: 101, year: 2025, budgetAmount: 4500 },
-    ],
-    last_year_transform: [{ currYear: 2025, prevYear: 2024 }],
+    year_shift: [{ currentYear: 2025, lastYear: 2024 }],
   },
 };
 
-const lastYearTransform: TableTransform = {
-  id: "LastYear",
-  relation: () => rowsToEnumerable(demoDb.tables.last_year_transform ?? []),
-  anchorAttr: "year",
-  fromColumn: "currYear",
-  toColumn: "prevYear",
-  factKey: "year",
-};
-
-const tables: SemanticModel["tables"] = {
-  store_dim: {
-    name: "store_dim",
-    grain: ["storeId"],
-    columns: {
-      storeId: { name: "storeId", type: "number" },
-      storeName: { name: "storeName", type: "string" },
-    },
+const attributes: Record<string, LogicalAttribute> = {
+  storeId: {
+    name: "storeId",
+    relation: "sales",
+    column: "storeId",
+    defaultFact: "sales",
   },
-  product_dim: {
-    name: "product_dim",
-    grain: ["productId"],
-    columns: {
-      productId: { name: "productId", type: "number" },
-      productName: { name: "productName", type: "string" },
-    },
+  year: {
+    name: "year",
+    relation: "sales",
+    column: "year",
+    defaultFact: "sales",
   },
-  date_dim: {
-    name: "date_dim",
-    grain: ["year", "month"],
-    columns: {
-      year: { name: "year", type: "number" },
-      month: { name: "month", type: "number" },
-    },
+  month: {
+    name: "month",
+    relation: "sales",
+    column: "month",
+    defaultFact: "sales",
   },
-  sales: {
-    name: "sales",
-    grain: ["storeId", "productId", "year", "month"],
-    columns: {
-      storeId: { name: "storeId", type: "number" },
-      productId: { name: "productId", type: "number" },
-      year: { name: "year", type: "number" },
-      month: { name: "month", type: "number" },
-      amount: { name: "amount", type: "number", defaultAgg: "sum" },
-    },
-  },
-  budget: {
-    name: "budget",
-    grain: ["storeId", "productId", "year"],
-    columns: {
-      storeId: { name: "storeId", type: "number" },
-      productId: { name: "productId", type: "number" },
-      year: { name: "year", type: "number" },
-      budgetAmount: { name: "budgetAmount", type: "number", defaultAgg: "sum" },
-    },
-  },
-};
-
-const attributes: SemanticModel["attributes"] = {
-  storeId: attr.id({ name: "storeId", table: "store_dim" }),
-  productId: attr.id({ name: "productId", table: "product_dim" }),
-  year: attr.id({ name: "year", table: "date_dim" }),
-  month: attr.id({ name: "month", table: "date_dim" }),
-};
-
-const measures: SemanticModel["measures"] = {
-  amount: measure.fact({ name: "amount", table: "sales" }),
-  budgetAmount: measure.fact({ name: "budgetAmount", table: "budget" }),
-};
-
-const relationalMetrics: RelationalMetricRegistry = {
-  totalSalesAmount: relAggregateMetric({
-    name: "totalSalesAmount",
-    measure: "amount",
-    agg: "sum",
-  }),
-  storeBudget: relAggregateMetric({
-    name: "storeBudget",
-    measure: "budgetAmount",
-    agg: "sum",
-    grain: ["storeId", "year"],
-  }),
-  yearlyBudget: relAggregateMetric({
-    name: "yearlyBudget",
-    measure: "budgetAmount",
-    agg: "sum",
-    grain: ["year"],
-  }),
-  negativeSales: relExpressionMetric({
-    name: "negativeSales",
-    measure: "amount",
-    expr: (values) => values.sum() * -1,
-  }),
-};
-
-const scalarMetrics = {
-  lastYearSales: factMeasure({
-    name: "lastYearSales",
-    factTable: "sales",
+  amount: {
+    name: "amount",
+    relation: "sales",
     column: "amount",
-    aggregate: "sum",
-    transform: lastYearTransform,
-  }),
+    defaultFact: "sales",
+  },
+  storeName: {
+    name: "storeName",
+    relation: "store_dim",
+    column: "storeName",
+    defaultFact: "sales",
+  },
 };
 
-const model: SemanticModel = {
-  tables,
+const rowsetTransforms: Record<string, RowsetTransformDefinition> = {
+  LastYear: {
+    id: "LastYear",
+    table: "year_shift",
+    anchorAttr: "year",
+    fromColumn: "currentYear",
+    toColumn: "lastYear",
+    factKey: "year",
+  },
+};
+
+const baseMetrics: MetricRegistryV2 = {
+  totalSales: aggregateMetric("totalSales", "amount", "sum"),
+  avgSale: aggregateMetric("avgSale", "amount", "avg"),
+};
+
+const transformMetric: MetricDefinitionV2 = rowsetTransformMetric({
+  name: "lastYearSales",
+  baseMetric: "totalSales",
+  transformId: "LastYear",
+});
+
+const dependentMetric: MetricDefinitionV2 = {
+  name: "highPerformerFlag",
+  deps: ["totalSales"],
+  eval: ({ evalMetric }) => {
+    const total = evalMetric("totalSales") ?? 0;
+    return total > 350 ? 1 : 0;
+  },
+};
+
+const model: SemanticModelV2 = {
+  facts: { sales: { name: "sales" } },
+  dimensions: { store_dim: { name: "store_dim" } },
   attributes,
-  measures,
-  metrics: scalarMetrics,
-  relationalMetrics,
-  transforms: {},
+  joins: [
+    { fact: "sales", dimension: "store_dim", factKey: "storeId", dimensionKey: "storeId" },
+  ],
+  metricsV2: {
+    ...baseMetrics,
+    lastYearSales: transformMetric,
+    highPerformerFlag: dependentMetric,
+  },
+  rowsetTransforms,
 };
 
-const env: MetricEvaluationEnvironment = {
-  model,
-  db: demoDb,
-};
+const env: MetricEvaluationEnvironment = { model: model as any, db };
 
-describe("relational semantic engine", () => {
-  it("filters rows down to a measure grain when projecting values", () => {
-    const values = projectMeasureValues(
-      "amount",
-      {
-        grain: ["storeId", "productId", "year", "month"],
-        filter: f.and(f.eq("storeId", 1), f.eq("year", 2025)),
-      },
-      env
-    ).toArray();
-
-    expect(values).to.deep.equal([150, 200, 300, 250]);
-  });
-
-  it("aggregates relational metrics per grain and globally", () => {
-    const byGrain = relationalMetrics.totalSalesAmount
-      .evalEnumerable(
-        { grain: ["storeId", "productId", "year"], filter: f.eq("year", 2025) },
-        env
-      )
-      .toArray();
-
-    expect(byGrain).to.deep.include({
-      storeId: 1,
-      productId: 100,
-      year: 2025,
-      totalSalesAmount: 350,
-    });
-    expect(byGrain).to.deep.include({
-      storeId: 2,
-      productId: 101,
-      year: 2025,
-      totalSalesAmount: 480,
-    });
-
-    const global = relationalMetrics.totalSalesAmount
-      .evalEnumerable({ grain: [], filter: f.eq("year", 2025) }, env)
-      .toArray();
-
-    expect(global).to.deep.equal([{ totalSalesAmount: 1680 }]);
-  });
-
-  it("builds frames via cross join and left joins relational metrics", () => {
-    const spec = {
-      table: "sales",
-      attributes: ["storeId", "productId", "year"],
-      metrics: [
-        "totalSalesAmount",
-        "storeBudget",
-        "yearlyBudget",
-        "negativeSales",
-      ],
-      filters: f.eq("year", 2025),
+describe("grain-agnostic semantic DSL", () => {
+  it("aggregates at the query grain without baking in grain", () => {
+    const spec: QuerySpecV2 = {
+      dimensions: ["storeId", "year"],
+      metrics: ["totalSales", "avgSale"],
+      where: f.eq("year", 2025),
     };
 
-    const rows = runRelationalQuery(env, spec as any);
+    const rows = runSemanticQuery(env, model, spec);
 
-    expect(rows).to.have.lengthOf(6); // 3 stores × 2 products × 1 year
-    expect(rows).to.deep.include({
-      storeId: 1,
-      productId: 100,
+    expect(rows).to.deep.include({ storeId: 1, year: 2025, totalSales: 350, avgSale: 175 });
+    expect(rows).to.deep.include({ storeId: 2, year: 2025, totalSales: 400, avgSale: 200 });
+  });
+
+  it("allows metrics to depend on other metrics at the same grain and apply having", () => {
+    const spec: QuerySpecV2 = {
+      dimensions: ["storeId", "year"],
+      metrics: ["totalSales", "highPerformerFlag"],
+      where: f.eq("year", 2025),
+      having: (metrics) => (metrics.totalSales ?? 0) > 350,
+    };
+
+    const rows = runSemanticQuery(env, model, spec);
+
+    expect(rows).to.have.lengthOf(1);
+    expect(rows[0]).to.deep.equal({
+      storeId: 2,
       year: 2025,
-      totalSalesAmount: 350,
-      storeBudget: 11000,
-      yearlyBudget: 19500,
-      negativeSales: -350,
-    });
-    expect(rows).to.deep.include({
-      storeId: 3,
-      productId: 101,
-      year: 2025,
-      totalSalesAmount: null,
-      storeBudget: null,
-      yearlyBudget: 19500,
-      negativeSales: null,
+      totalSales: 400,
+      highPerformerFlag: 1,
     });
   });
 
-  it("applies table transforms before aggregating fact measures", () => {
-    const result = evaluateMetric(
-      "lastYearSales",
-      env,
-      { filter: f.eq("year", 2025) }
-    );
+  it("applies rowset transforms to evaluate base metrics on shifted rowsets", () => {
+    const spec: QuerySpecV2 = {
+      dimensions: ["storeId", "year"],
+      metrics: ["totalSales", "lastYearSales"],
+      where: f.eq("year", 2025),
+    };
 
-    expect(result).to.equal(975);
+    const rows = runSemanticQuery(env, model, spec);
+
+    expect(rows).to.deep.include({
+      storeId: 1,
+      year: 2025,
+      totalSales: 350,
+      lastYearSales: 170,
+    });
+    expect(rows).to.deep.include({
+      storeId: 2,
+      year: 2025,
+      totalSales: 400,
+      lastYearSales: 110,
+    });
   });
 });
