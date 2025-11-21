@@ -1,11 +1,15 @@
 // semanticEngineV2.ts
 // Minimal V2-only semantic metrics engine
 //
+// Key ideas:
+//
 // - Metrics are grain-agnostic: they only see { rows, groupKey }.
 // - Grain is defined by the query's dimensions.
-// - Engine chooses a base fact, joins dimensions, applies filters,
-//   groups by dimensions, then evaluates metrics per group.
-// - Rowset transforms support time-intelligence (e.g. last year/week).
+// - If metrics exist, their baseFact determines which fact table to use.
+// - If there are *no metrics*, and all attributes come from a single relation
+//   (e.g. dim_store), we treat that dimension table itself as the base.
+// - Rowset transforms support time-intelligence (e.g. last-year) by shifting
+//   which rows a metric sees, but still reporting at the current grain.
 
 import Enumerable from "./linq";
 
@@ -22,7 +26,7 @@ export function rowsToEnumerable(rows: Row[] = []) {
 export type RowSequence = Enumerable.IEnumerable<Row>;
 
 /* --------------------------------------------------------------------------
- * FILTER TYPES + HELPERS (ATTRIBUTE-LEVEL WHERE)
+ * FILTER TYPES + HELPERS
  * -------------------------------------------------------------------------- */
 
 export type FilterPrimitive = string | number | boolean | Date;
@@ -220,18 +224,19 @@ export interface InMemoryDb {
 }
 
 /* --------------------------------------------------------------------------
- * SEMANTIC MODEL V2 (FACTS, DIMENSIONS, ATTRIBUTES, JOINS)
+ * SEMANTIC MODEL V2
  * -------------------------------------------------------------------------- */
 
 /**
  * Logical attribute definition that maps a semantic name to a concrete
- * relation/column and declares which fact it is reachable from by default.
+ * relation/column. There is no defaultFact; if metrics exist, their baseFact
+ * drives the fact choice. If there are no metrics, and all attributes come
+ * from a single relation, that relation becomes the base (dimension fallback).
  */
 export interface LogicalAttribute {
   name: string;
-  relation: string; // table name where the column lives
+  relation: string; // table name where the column lives (fact or dimension)
   column: string;
-  defaultFact: string; // base fact that can reach this attribute
 }
 
 export interface FactRelation {
@@ -247,11 +252,11 @@ export interface JoinEdge {
 
 export interface RowsetTransformDefinition {
   id: string;
-  table: string;       // transform lookup table
-  anchorAttr: string;  // logical attribute used as "current period"
+  table: string;       // transform lookup table (e.g. tradyrwk_transform)
+  anchorAttr: string;  // logical attribute used as "current period" (e.g. tradyrwkcode)
   fromColumn: string;  // column on transform table that matches current period
-  toColumn: string;    // column on transform table that matches factKey (e.g., last-year period)
-  factKey: string;     // logical attribute on fact rows to filter by (should be in attributes)
+  toColumn: string;    // column on transform table that matches factKey (e.g. tradyrwkcode_lastyear)
+  factKey: string;     // logical attribute on fact rows to filter by (e.g. tradyrwkcode)
 }
 
 export interface SemanticModelV2 {
@@ -264,7 +269,7 @@ export interface SemanticModelV2 {
 }
 
 /* --------------------------------------------------------------------------
- * METRIC DEFINITIONS (V2, GRAIN-AGNOSTIC)
+ * METRICS (V2, GRAIN-AGNOSTIC)
  * -------------------------------------------------------------------------- */
 
 export type AggregationOperator = "sum" | "avg" | "count" | "min" | "max";
@@ -272,16 +277,12 @@ export type AggregationOperator = "sum" | "avg" | "count" | "min" | "max";
 export interface MetricRuntimeV2 {
   model: SemanticModelV2;
   db: InMemoryDb;
-  baseFact: string;
   relation: RowSequence;        // joined + where-filtered relation
   whereFilter: FilterNode | null;
   groupDimensions: string[];    // logical dimension names for this query
+  baseFact?: string;            // present when metrics use a fact table
 }
 
-/**
- * Metric computation context: metrics only know about the rows of their group,
- * the groupKey, and a way to evaluate dependent metrics or apply rowset transforms.
- */
 export interface MetricComputationContext {
   rows: RowSequence;                             // grouped rows for this output row
   groupKey: Record<string, any>;                // dimension values for this group
@@ -296,8 +297,8 @@ export type MetricEvalV2 = (
 export interface MetricDefinitionV2 {
   name: string;
   description?: string;
-  baseFact?: string;      // optional: preferred base fact
-  attributes?: string[];  // logical attributes this metric needs
+  baseFact?: string;      // which fact this metric is tied to (for fact-based metrics)
+  attributes?: string[];  // logical attributes this metric depends on
   deps?: string[];        // dependent metrics
   eval: MetricEvalV2;
 }
@@ -321,7 +322,8 @@ export interface QuerySpecV2 {
   metrics: string[];                             // metric names
   where?: FilterContext;                         // attribute-level filter
   having?: (values: Record<string, number | undefined>) => boolean;
-  baseFact?: string;                             // optional override
+  // NOTE: no baseFact here; base fact is determined by metrics if present,
+  // or falls back to a dimension relation when there are no metrics.
 }
 
 /* --------------------------------------------------------------------------
@@ -369,19 +371,18 @@ function mapLogicalAttributes(
 }
 
 /**
- * Build a base relation starting from the base fact:
+ * Build a base relation starting from a fact:
  * - factProjected: fact rows projected to logical attributes on the fact.
  * - joined: factProjected joined with any needed dimensions, projected to logical attrs.
  *
- * NOTE: for simplicity, joins are always from fact -> dimension using JoinEdge,
- * and only one edge per dim is supported.
+ * Assumes joins are from baseFact -> dimension using JoinEdge.
  */
-function buildBaseRelation(
+function buildFactBaseRelation(
   model: SemanticModelV2,
   db: InMemoryDb,
   baseFact: string,
   requiredAttributes: Set<string>
-): { joined: RowSequence } {
+): RowSequence {
   const joinLookup = buildJoinLookup(model.joins);
   const factRows = rowsToEnumerable(db.tables[baseFact] ?? []);
 
@@ -409,7 +410,6 @@ function buildBaseRelation(
     }
     const dimensionRows = rowsToEnumerable(db.tables[relation] ?? []);
 
-    // project logical attrs from dimension, plus a __joinKey to match on
     const mappedDimension = dimensionRows.select((row: Row) => ({
       __joinKey: (row as any)[join.dimensionKey],
       ...mapLogicalAttributes(row, relation, model.attributes, requiredAttributes),
@@ -428,7 +428,23 @@ function buildBaseRelation(
     });
   });
 
-  return { joined };
+  return joined;
+}
+
+/**
+ * Build a base relation from a single relation (typically a dimension) when
+ * there are no metrics and all attributes live on that one table.
+ */
+function buildDimensionBaseRelation(
+  model: SemanticModelV2,
+  db: InMemoryDb,
+  relationName: string,
+  requiredAttributes: Set<string>
+): RowSequence {
+  const rows = rowsToEnumerable(db.tables[relationName] ?? []);
+  return rows.select((row: Row) =>
+    mapLogicalAttributes(row, relationName, model.attributes, requiredAttributes)
+  );
 }
 
 function keyFromGroup(groupKey: Record<string, any>): string {
@@ -442,7 +458,7 @@ function keyFromRow(row: Row, attrs: string[]): string {
 }
 
 /* --------------------------------------------------------------------------
- * SIMPLE AGGREGATE METRICS (SUM/AVG/etc OVER AN ATTRIBUTE)
+ * SIMPLE AGGREGATE METRICS
  * -------------------------------------------------------------------------- */
 
 function aggregate(
@@ -475,16 +491,21 @@ function aggregate(
 
 /**
  * Aggregate metric over a single logical attribute.
- * Grain is entirely determined by the query; metric just sums/avgs over group rows.
+ * Grain is entirely determined by the query; metric just aggregates over group rows.
+ *
+ * NOTE: baseFact is optional. For fact-based metrics you should set it so
+ * the engine knows which fact table to use when metrics are present.
  */
 export function aggregateMetric(
   name: string,
   attr: string,
-  op: AggregationOperator = "sum"
+  op: AggregationOperator = "sum",
+  baseFact?: string
 ): MetricDefinitionV2 {
   return {
     name,
     attributes: [attr],
+    baseFact,
     eval: ({ rows }) => aggregate(rows, attr, op),
   };
 }
@@ -493,19 +514,6 @@ export function aggregateMetric(
  * ROWSET TRANSFORMS (E.G. LAST-YEAR)
  * -------------------------------------------------------------------------- */
 
-/**
- * Rowset-transform metric: wraps a base metric and evaluates it on a transformed
- * rowset (e.g., last-year rows) while still reporting at the current grain.
- *
- * Example usage:
- *
- *   const sumSales = aggregateMetric("sum_sales", "sales", "sum");
- *   const sumSalesLastYear = rowsetTransformMetric({
- *     name: "sum_sales_last_year",
- *     baseMetric: "sum_sales",
- *     transformId: "lastYearWeek",
- *   });
- */
 export function rowsetTransformMetric(opts: {
   name: string;
   baseMetric: string;
@@ -549,7 +557,7 @@ function applyRowsetTransform(
     runtime.db.tables[transform.table] ?? []
   );
 
-  // 1. Find target anchor values (e.g., last-year codes) for this group's anchor.
+  // 1. Find target anchor values (e.g., last-year week codes) for this group's anchor.
   const targetAnchors = transformRows
     .where((r: Row) => (r as any)[transform.fromColumn] === anchorValue)
     .select((r: Row) => (r as any)[transform.toColumn])
@@ -568,14 +576,14 @@ function applyRowsetTransform(
     if (!allowedAnchor.has((row as any)[transform.factKey])) return false;
 
     return runtime.groupDimensions.every((dim) => {
-      if (dim === transform.anchorAttr) return true; // we are shifting this
+      if (dim === transform.anchorAttr) return true; // this is the shifted dimension
       return (row as any)[dim] === groupKey[dim];
     });
   });
 }
 
 /* --------------------------------------------------------------------------
- * METRIC EVALUATION V2
+ * METRIC EVALUATION (V2)
  * -------------------------------------------------------------------------- */
 
 function evaluateMetricV2(
@@ -625,7 +633,7 @@ export function runSemanticQuery(
   const { db, model } = env;
   const dimensions = spec.dimensions;
 
-  // 1. Figure out which logical attributes are required:
+  // 1. Collect required attributes: from dimensions, where, and metric attribute hints
   const whereFields = collectFilterFields(spec.where);
   const metricAttrFields = new Set<string>();
 
@@ -638,29 +646,68 @@ export function runSemanticQuery(
   whereFields.forEach((f) => requiredAttrs.add(f));
   metricAttrFields.forEach((f) => requiredAttrs.add(f));
 
-  // 2. Choose base fact:
-  const baseFact =
-    spec.baseFact ??
-    spec.metrics
-      .map((m) => model.metricsV2[m]?.baseFact)
-      .find((f) => !!f) ??
-    [...requiredAttrs]
-      .map((attr) => model.attributes[attr]?.defaultFact)
-      .find((f) => !!f);
+  const requiredAttrsArray = Array.from(requiredAttrs);
 
-  if (!baseFact) {
-    throw new Error("Unable to determine a base fact for the query");
+  // 2. Determine base fact (if any) from metrics:
+  const metricBaseFacts = new Set<string>();
+  spec.metrics.forEach((m) => {
+    const fact = model.metricsV2[m]?.baseFact;
+    if (fact) metricBaseFacts.add(fact);
+  });
+
+  if (metricBaseFacts.size > 1) {
+    throw new Error(
+      `Metrics refer to multiple base facts (${Array.from(
+        metricBaseFacts
+      ).join(", ")}); multi-fact queries are not supported in this minimal engine`
+    );
   }
 
-  // 3. Build joined relation from base fact + needed dimensions:
-  const { joined } = buildBaseRelation(model, db, baseFact, requiredAttrs);
+  let relation: RowSequence;
+  let baseFact: string | undefined;
 
-  // 4. Apply where filter:
-  const availableAttrs = Array.from(requiredAttrs);
+  if (metricBaseFacts.size === 1) {
+    // Fact-based query: start from the chosen fact and join dimensions.
+    baseFact = Array.from(metricBaseFacts)[0];
+    relation = buildFactBaseRelation(model, db, baseFact, requiredAttrs);
+  } else if (spec.metrics.length === 0) {
+    // No metrics: dimension fallback. All attributes must live on a single relation.
+    const relationsUsed = new Set<string>();
+    for (const attr of requiredAttrs) {
+      const def = model.attributes[attr];
+      if (!def) continue;
+      relationsUsed.add(def.relation);
+    }
+
+    if (relationsUsed.size === 0) {
+      // No attributes and no metrics -> empty result
+      return [];
+    }
+
+    if (relationsUsed.size > 1) {
+      throw new Error(
+        `Dimension-only query references attributes from multiple relations ` +
+          `(${Array.from(relationsUsed).join(
+            ", "
+          )}); engine cannot relate them without a fact table`
+      );
+    }
+
+    const singleRelation = Array.from(relationsUsed)[0];
+    relation = buildDimensionBaseRelation(model, db, singleRelation, requiredAttrs);
+  } else {
+    // We have metrics but none declared a baseFact -> ambiguous design-time error.
+    throw new Error(
+      `Metrics provided but none declares a baseFact; engine cannot choose a fact table. ` +
+        `Please set baseFact on your fact-based metrics.`
+    );
+  }
+
+  // 3. Apply where filter over available attributes
   const whereNode = normalizeFilterContext(spec.where);
-  const filtered = applyWhereFilter(joined, spec.where, availableAttrs);
+  const filtered = applyWhereFilter(relation, spec.where, requiredAttrsArray);
 
-  // 5. Build runtime for metric evaluation:
+  // 4. Build runtime for metric evaluation
   const runtime: MetricRuntimeV2 = {
     model,
     db,
@@ -670,7 +717,7 @@ export function runSemanticQuery(
     groupDimensions: dimensions,
   };
 
-  // 6. Group by dimensions:
+  // 5. Group by dimensions
   const grouped = filtered.groupBy(
     (row: Row) => keyFromRow(row, dimensions),
     (row: Row) => row
