@@ -100,3 +100,30 @@ Frame (store × product × year)
 5. **Experiment**: because every operation is LINQ-backed, it is straightforward to add more complex joins, windows, or label enrichment steps directly inside metrics or helper functions.
 
 Everything runs fully in-memory, making this repository a safe playground for prototyping relational-semantic ideas before porting them to a SQL-backed engine.
+
+## Grain-agnostic DSL (PLAN.md alignment)
+
+`PLAN.md` describes a grain-agnostic metric contract where metrics are pure functions over the fact rows for the current group. The new helpers in `semanticEngine.ts` (`runSemanticQuery`, `aggregateMetric`, `rowsetTransformMetric`) implement that flow:
+
+```ts
+import {
+  aggregateMetric,
+  rowsetTransformMetric,
+  runSemanticQuery,
+  f,
+} from "./src/semanticEngine";
+
+const model = { /* SemanticModelV2 with attributes, joins, metrics */ };
+const env = { model, db };
+
+const spec = {
+  dimensions: ["storeId", "year"],
+  metrics: ["totalSales", "lastYearSales"],
+  where: f.eq("year", 2025),
+};
+
+const rows = runSemanticQuery(env, model, spec);
+// → rows grouped by (storeId, year) with metrics evaluated per group
+```
+
+Metrics never hardcode their own grain; they recompute from the fact rows supplied by the query grain, and rowset transforms (e.g., last-year shifts) run as higher-order wrappers around those base metrics.
