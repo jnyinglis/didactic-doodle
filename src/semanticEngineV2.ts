@@ -386,8 +386,16 @@ function buildFactBaseRelation(
   const joinLookup = buildJoinLookup(model.joins);
   const factRows = rowsToEnumerable(db.tables[baseFact] ?? []);
 
+  const factJoinKeys = model.joins
+    .filter((edge) => edge.fact === baseFact)
+    .map((edge) => edge.factKey);
+
   const factProjected = factRows.select((row: Row) => ({
     ...mapLogicalAttributes(row, baseFact, model.attributes, requiredAttributes),
+    ...factJoinKeys.reduce((acc, key) => {
+      acc[key] = (row as any)[key];
+      return acc;
+    }, {} as Row),
   }));
 
   const neededRelations = new Set<string>();
@@ -633,46 +641,33 @@ export function runSemanticQuery(
   const { db, model } = env;
   const dimensions = spec.dimensions;
 
-  // 1. Collect required attributes: from dimensions, where, and metric attribute hints
   const whereFields = collectFilterFields(spec.where);
-  const metricAttrFields = new Set<string>();
+
+  const metricAttributesByFact = new Map<string | undefined, Set<string>>();
+  const metricsByFact = new Map<string | undefined, string[]>();
 
   spec.metrics.forEach((m) => {
     const def = model.metricsV2[m];
-    def?.attributes?.forEach((a) => metricAttrFields.add(a));
+    const fact = def?.baseFact;
+    const list = metricsByFact.get(fact) ?? [];
+    list.push(m);
+    metricsByFact.set(fact, list);
+
+    const attrSet = metricAttributesByFact.get(fact) ?? new Set<string>();
+    def?.attributes?.forEach((a) => attrSet.add(a));
+    metricAttributesByFact.set(fact, attrSet);
   });
 
-  const requiredAttrs = new Set<string>([...dimensions]);
-  whereFields.forEach((f) => requiredAttrs.add(f));
-  metricAttrFields.forEach((f) => requiredAttrs.add(f));
+  const factNames = Array.from(metricsByFact.keys()).filter(
+    (f): f is string => !!f
+  );
 
-  const requiredAttrsArray = Array.from(requiredAttrs);
-
-  // 2. Determine base fact (if any) from metrics:
-  const metricBaseFacts = new Set<string>();
-  spec.metrics.forEach((m) => {
-    const fact = model.metricsV2[m]?.baseFact;
-    if (fact) metricBaseFacts.add(fact);
-  });
-
-  if (metricBaseFacts.size > 1) {
-    throw new Error(
-      `Metrics refer to multiple base facts (${Array.from(
-        metricBaseFacts
-      ).join(", ")}); multi-fact queries are not supported in this minimal engine`
-    );
-  }
-
-  let relation: RowSequence;
-  let baseFact: string | undefined;
-
-  if (metricBaseFacts.size === 1) {
-    // Fact-based query: start from the chosen fact and join dimensions.
-    baseFact = Array.from(metricBaseFacts)[0];
-    relation = buildFactBaseRelation(model, db, baseFact, requiredAttrs);
-  } else if (spec.metrics.length === 0) {
-    // No metrics: dimension fallback. All attributes must live on a single relation.
+  // Dimension-only query (no metrics)
+  if (spec.metrics.length === 0) {
     const relationsUsed = new Set<string>();
+    const requiredAttrs = new Set<string>([...dimensions]);
+    whereFields.forEach((f) => requiredAttrs.add(f));
+
     for (const attr of requiredAttrs) {
       const def = model.attributes[attr];
       if (!def) continue;
@@ -680,62 +675,184 @@ export function runSemanticQuery(
     }
 
     if (relationsUsed.size === 0) {
-      // No attributes and no metrics -> empty result
       return [];
     }
 
     if (relationsUsed.size > 1) {
       throw new Error(
         `Dimension-only query references attributes from multiple relations ` +
-          `(${Array.from(relationsUsed).join(
-            ", "
-          )}); engine cannot relate them without a fact table`
+          `(${Array.from(relationsUsed).join(", ")}); engine cannot relate them without a fact table`
       );
     }
 
     const singleRelation = Array.from(relationsUsed)[0];
-    relation = buildDimensionBaseRelation(model, db, singleRelation, requiredAttrs);
-  } else {
-    // We have metrics but none declared a baseFact -> ambiguous design-time error.
-    throw new Error(
-      `Metrics provided but none declares a baseFact; engine cannot choose a fact table. ` +
-        `Please set baseFact on your fact-based metrics.`
+    const relation = buildDimensionBaseRelation(
+      model,
+      db,
+      singleRelation,
+      requiredAttrs
     );
+
+    const filtered = applyWhereFilter(
+      relation,
+      spec.where,
+      Array.from(requiredAttrs)
+    );
+
+    const grouped = filtered.groupBy(
+      (row: Row) => keyFromRow(row, dimensions),
+      (row: Row) => row
+    );
+
+    const results: Row[] = [];
+    grouped.forEach((group) => {
+      const sample = group.first();
+      const groupKey: Record<string, any> = {};
+      if (sample) {
+        dimensions.forEach((d) => (groupKey[d] = (sample as any)[d]));
+      }
+      results.push(groupKey);
+    });
+
+    return results;
   }
 
-  // 3. Apply where filter over available attributes
-  const whereNode = normalizeFilterContext(spec.where);
-  const filtered = applyWhereFilter(relation, spec.where, requiredAttrsArray);
+  // Metrics provided but none declared baseFact -> treat as dimension metrics
+  if (factNames.length === 0) {
+    const requiredAttrs = new Set<string>([...dimensions]);
+    whereFields.forEach((f) => requiredAttrs.add(f));
+    (metricAttributesByFact.get(undefined) ?? new Set()).forEach((a) =>
+      requiredAttrs.add(a)
+    );
 
-  // 4. Build runtime for metric evaluation
-  const runtime: MetricRuntimeV2 = {
+    const relationsUsed = new Set<string>();
+    for (const attr of requiredAttrs) {
+      const def = model.attributes[attr];
+      if (!def) continue;
+      relationsUsed.add(def.relation);
+    }
+
+    if (relationsUsed.size !== 1) {
+      throw new Error(
+        `Metrics provided but none declares a baseFact; engine cannot choose a fact table. ` +
+          `Please set baseFact on fact metrics or constrain attributes to one relation.`
+      );
+    }
+
+    const singleRelation = Array.from(relationsUsed)[0];
+    const relation = buildDimensionBaseRelation(
+      model,
+      db,
+      singleRelation,
+      requiredAttrs
+    );
+    const filtered = applyWhereFilter(
+      relation,
+      spec.where,
+      Array.from(requiredAttrs)
+    );
+    const whereNode = normalizeFilterContext(spec.where);
+
+    const grouped = filtered.groupBy(
+      (row: Row) => keyFromRow(row, dimensions),
+      (row: Row) => row
+    );
+
+    const results: Row[] = [];
+    grouped.forEach((group) => {
+      const sample = group.first();
+      const groupKey: Record<string, any> = {};
+      if (sample) {
+        dimensions.forEach((d) => (groupKey[d] = (sample as any)[d]));
+      }
+
+      const runtime: MetricRuntimeV2 = {
+        model,
+        db,
+        baseFact: undefined,
+        relation: group,
+        whereFilter: whereNode,
+        groupDimensions: dimensions,
+      };
+
+      const metricValues: Record<string, number | undefined> = {};
+      const metricCache = new Map<string, number | undefined>();
+      (metricsByFact.get(undefined) ?? []).forEach((m) => {
+        metricValues[m] = evaluateMetricV2(
+          m,
+          runtime,
+          groupKey,
+          group,
+          undefined,
+          metricCache
+        );
+      });
+
+      if (spec.having && !spec.having(metricValues)) {
+        return;
+      }
+
+      results.push({ ...groupKey, ...metricValues });
+    });
+
+    return results;
+  }
+
+  const primaryFact = factNames[0];
+  const frameRequiredAttrs = new Set<string>([...dimensions]);
+  whereFields.forEach((f) => frameRequiredAttrs.add(f));
+  (metricAttributesByFact.get(primaryFact) ?? new Set()).forEach((a) =>
+    frameRequiredAttrs.add(a)
+  );
+  (metricAttributesByFact.get(undefined) ?? new Set()).forEach((a) =>
+    frameRequiredAttrs.add(a)
+  );
+
+  const frameRelation = buildFactBaseRelation(
     model,
     db,
-    baseFact,
-    relation: filtered,
-    whereFilter: whereNode,
-    groupDimensions: dimensions,
-  };
+    primaryFact,
+    frameRequiredAttrs
+  );
 
-  // 5. Group by dimensions
-  const grouped = filtered.groupBy(
+  const whereNode = normalizeFilterContext(spec.where);
+  const frameFiltered = applyWhereFilter(
+    frameRelation,
+    spec.where,
+    Array.from(frameRequiredAttrs)
+  );
+
+  const frameGroups = frameFiltered.groupBy(
     (row: Row) => keyFromRow(row, dimensions),
     (row: Row) => row
   );
 
   const results: Row[] = [];
+  const frameGroupLookup = new Map<string, RowSequence>();
 
-  grouped.forEach((group) => {
+  frameGroups.forEach((group) => {
     const sample = group.first();
     const groupKey: Record<string, any> = {};
     if (sample) {
       dimensions.forEach((d) => (groupKey[d] = (sample as any)[d]));
     }
 
-    const metricCache = new Map<string, number | undefined>();
-    const metricValues: Record<string, number | undefined> = {};
+    const keyStr = keyFromGroup(groupKey);
+    frameGroupLookup.set(keyStr, group);
 
-    spec.metrics.forEach((m) => {
+    const runtime: MetricRuntimeV2 = {
+      model,
+      db,
+      baseFact: primaryFact,
+      relation: group,
+      whereFilter: whereNode,
+      groupDimensions: dimensions,
+    };
+
+    const metricValues: Record<string, number | undefined> = {};
+    const metricCache = new Map<string, number | undefined>();
+
+    (metricsByFact.get(primaryFact) ?? []).forEach((m) => {
       metricValues[m] = evaluateMetricV2(
         m,
         runtime,
@@ -746,12 +863,116 @@ export function runSemanticQuery(
       );
     });
 
-    if (spec.having && !spec.having(metricValues)) {
-      return;
-    }
-
     results.push({ ...groupKey, ...metricValues });
   });
 
+  for (const [fact, metricNames] of metricsByFact.entries()) {
+    if (!fact || fact === primaryFact) continue;
+
+    const attrsForFact = new Set<string>([...dimensions]);
+    whereFields.forEach((f) => attrsForFact.add(f));
+    (metricAttributesByFact.get(fact) ?? new Set()).forEach((a) =>
+      attrsForFact.add(a)
+    );
+
+    const factRelation = buildFactBaseRelation(
+      model,
+      db,
+      fact,
+      attrsForFact
+    );
+
+    const factFiltered = applyWhereFilter(
+      factRelation,
+      spec.where,
+      Array.from(attrsForFact)
+    );
+
+    const factGroups = factFiltered.groupBy(
+      (row: Row) => keyFromRow(row, dimensions),
+      (row: Row) => row
+    );
+
+    const factMetricMap = new Map<string, Record<string, number | undefined>>();
+
+    factGroups.forEach((group) => {
+      const sample = group.first();
+      if (!sample) return;
+
+      const groupKey: Record<string, any> = {};
+      dimensions.forEach((d) => (groupKey[d] = (sample as any)[d]));
+      const keyStr = keyFromGroup(groupKey);
+
+      const runtime: MetricRuntimeV2 = {
+        model,
+        db,
+        baseFact: fact,
+        relation: group,
+        whereFilter: whereNode,
+        groupDimensions: dimensions,
+      };
+
+      const metricCache = new Map<string, number | undefined>();
+      const values: Record<string, number | undefined> = {};
+
+      metricNames.forEach((m) => {
+        values[m] = evaluateMetricV2(
+          m,
+          runtime,
+          groupKey,
+          group,
+          undefined,
+          metricCache
+        );
+      });
+
+      factMetricMap.set(keyStr, values);
+    });
+
+    for (const row of results) {
+      const groupKey: Record<string, any> = {};
+      dimensions.forEach((d) => (groupKey[d] = row[d]));
+      const keyStr = keyFromGroup(groupKey);
+      const factValues = factMetricMap.get(keyStr) ?? {};
+      Object.assign(row, factValues);
+    }
+  }
+
+  const dimensionMetrics = metricsByFact.get(undefined) ?? [];
+  if (dimensionMetrics.length) {
+    for (const row of results) {
+      const groupKey: Record<string, any> = {};
+      dimensions.forEach((d) => (groupKey[d] = row[d]));
+      const keyStr = keyFromGroup(groupKey);
+      const group = frameGroupLookup.get(keyStr) ?? rowsToEnumerable([]);
+
+      const runtime: MetricRuntimeV2 = {
+        model,
+        db,
+        baseFact: undefined,
+        relation: group,
+        whereFilter: whereNode,
+        groupDimensions: dimensions,
+      };
+
+      const metricCache = new Map<string, number | undefined>();
+      dimensionMetrics.forEach((m) => {
+        row[m] = evaluateMetricV2(
+          m,
+          runtime,
+          groupKey,
+          group,
+          undefined,
+          metricCache
+        );
+      });
+    }
+  }
+
+  if (spec.having) {
+    return results.filter((r) => spec.having?.(r as any));
+  }
+
   return results;
 }
+
