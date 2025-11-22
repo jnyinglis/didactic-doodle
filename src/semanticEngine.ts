@@ -294,6 +294,9 @@ export type MetricEval = (
   ctx: MetricComputationContext
 ) => number | undefined;
 
+// V2 compatibility aliases
+export type MetricEvalV2 = MetricEval;
+
 export interface MetricDefinition {
   name: string;
   description?: string;
@@ -301,6 +304,10 @@ export interface MetricDefinition {
   attributes?: string[];  // logical attributes this metric depends on
   deps?: string[];        // dependent metrics
   eval: MetricEval;
+}
+
+export interface MetricDefinitionV2 extends MetricDefinition {
+  exprAst?: any;
 }
 
 export type MetricRegistry = Record<string, MetricDefinition>;
@@ -325,6 +332,8 @@ export interface QuerySpec {
   // NOTE: no baseFact here; base fact is determined by metrics if present,
   // or falls back to a dimension relation when there are no metrics.
 }
+
+export type QuerySpecV2 = QuerySpec;
 
 /* --------------------------------------------------------------------------
  * SEMANTIC HELPERS
@@ -628,6 +637,17 @@ function evaluateMetric(
   const value = metric.eval({ rows, groupKey, evalMetric, helpers });
   workingCache.set(cacheKey, value);
   return value;
+}
+
+export function evaluateMetricRuntime(
+  metricName: string,
+  runtime: MetricRuntime,
+  groupKey: Record<string, any>,
+  rows: RowSequence,
+  cacheLabel?: string,
+  cache?: Map<string, number | undefined>
+): number | undefined {
+  return evaluateMetric(metricName, runtime, groupKey, rows, cacheLabel, cache);
 }
 
 /* --------------------------------------------------------------------------
