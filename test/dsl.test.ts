@@ -14,8 +14,8 @@ import {
 
 describe("DSL parser and compiler", () => {
   const attributes: Record<string, LogicalAttribute> = {
-    tradyrwkcode: { name: "tradyrwkcode", relation: "fact_sales", column: "tradyrwkcode" },
-    sales_amount: { name: "sales_amount", relation: "fact_sales", column: "sales_amount" },
+    tradyrwkcode: { table: "fact_sales" },
+    sales_amount: { table: "fact_sales" },
   };
 
   it("parses metric declarations and expressions", () => {
@@ -75,19 +75,18 @@ query weekly_sales_vs_last_year {
     };
 
     const baseModel: SemanticModel = {
-      facts: { fact_sales: { name: "fact_sales" } },
+      facts: { fact_sales: { table: "fact_sales" } },
       dimensions: {},
       attributes,
       joins: [],
       metrics: {},
       rowsetTransforms: {
         "last_year:tradyrwkcode": {
-          id: "last_year:tradyrwkcode",
           table: "tradyrwk_transform",
           anchorAttr: "tradyrwkcode",
           fromColumn: "tradyrwkcode",
           toColumn: "tradyrwkcode_lastyear",
-          factKey: "tradyrwkcode",
+          factAttr: "tradyrwkcode",
         },
       },
     };

@@ -234,34 +234,50 @@ export interface InMemoryDb {
  * from a single relation, that relation becomes the base (dimension fallback).
  */
 export interface LogicalAttribute {
-  name: string;
-  relation: string; // table name where the column lives (fact or dimension)
-  column: string;
+  /** Physical table where this attribute lives (fact or dimension). */
+  table: string;
+
+  /** Physical column name; defaults to the attribute ID. */
+  column?: string;
 }
 
-export interface FactRelation {
-  name: string;
+export interface FactDefinition {
+  /** Physical table name for this fact. Defaults to the fact ID. */
+  table?: string;
+}
+
+export interface DimensionDefinition {
+  /** Physical table name for this dimension. Defaults to the dimension ID. */
+  table?: string;
 }
 
 export interface JoinEdge {
-  fact: string;
-  dimension: string;
-  factKey: string;       // physical column name on fact
-  dimensionKey: string;  // physical column name on dimension
+  fact: string; // fact ID (registry key)
+  dimension: string; // dimension ID (registry key)
+  factKey: string; // physical column name on fact
+  dimensionKey: string; // physical column name on dimension
 }
 
 export interface RowsetTransformDefinition {
-  id: string;
-  table: string;       // transform lookup table (e.g. tradyrwk_transform)
-  anchorAttr: string;  // logical attribute used as "current period" (e.g. tradyrwkcode)
-  fromColumn: string;  // column on transform table that matches current period
-  toColumn: string;    // column on transform table that matches factKey (e.g. tradyrwkcode_lastyear)
-  factKey: string;     // logical attribute on fact rows to filter by (e.g. tradyrwkcode)
+  /** Physical transform lookup table (e.g. tradyrwk_transform). */
+  table: string;
+
+  /** Attribute ID used as "current period" (e.g. tradyrwkcode). */
+  anchorAttr: string;
+
+  /** Column on transform.table that matches current period. */
+  fromColumn: string;
+
+  /** Column on transform.table that matches factAttr (e.g. tradyrwkcode_lastyear). */
+  toColumn: string;
+
+  /** Attribute ID on fact rows to filter by (e.g. tradyrwkcode). */
+  factAttr: string;
 }
 
 export interface SemanticModel {
-  facts: Record<string, FactRelation>;
-  dimensions: Record<string, { name: string }>;
+  facts: Record<string, FactDefinition>;
+  dimensions: Record<string, DimensionDefinition>;
   attributes: Record<string, LogicalAttribute>;
   joins: JoinEdge[];
   metrics: MetricRegistry;
@@ -442,20 +458,48 @@ export type QuerySpecV2 = QuerySpec;
  * SEMANTIC HELPERS
  * -------------------------------------------------------------------------- */
 
-function normalizeAttribute(def: LogicalAttribute): LogicalAttribute {
+interface NormalizedAttribute {
+  id: string;
+  table: string;
+  column: string;
+}
+
+interface NormalizedFact {
+  id: string;
+  table: string;
+}
+
+interface NormalizedDimension {
+  id: string;
+  table: string;
+}
+
+function normalizeAttribute(id: string, def: LogicalAttribute): NormalizedAttribute {
   return {
-    ...def,
-    column: def.column ?? def.name,
+    id,
+    table: def.table,
+    column: def.column ?? id,
   };
 }
 
-function attributesForRelation(
-  relation: string,
+function normalizeFact(id: string, def: FactDefinition): NormalizedFact {
+  return { id, table: def.table ?? id };
+}
+
+function normalizeDimension(
+  id: string,
+  def: DimensionDefinition
+): NormalizedDimension {
+  return { id, table: def.table ?? id };
+}
+
+function attributesForTable(
+  table: string,
   attributes: Record<string, LogicalAttribute>
-): LogicalAttribute[] {
-  return Object.values(attributes)
-    .map(normalizeAttribute)
-    .filter((a) => a.relation === relation);
+): NormalizedAttribute[] {
+  return Object.entries(attributes)
+    .map(([id, def]) => normalizeAttribute(id, def))
+    .filter((a) => a.table === table);
 }
 
 function buildJoinLookup(edges: JoinEdge[]): Map<string, JoinEdge> {
@@ -468,14 +512,14 @@ function buildJoinLookup(edges: JoinEdge[]): Map<string, JoinEdge> {
 
 function mapLogicalAttributes(
   row: Row,
-  relation: string,
+  table: string,
   attrRegistry: Record<string, LogicalAttribute>,
   needed: Set<string>
 ): Row {
-  const attrs = attributesForRelation(relation, attrRegistry);
+  const attrs = attributesForTable(table, attrRegistry);
   const mapped: Row = {};
   for (const attr of attrs) {
-    const logical = attr.name;
+    const logical = attr.id;
     if (needed.size && !needed.has(logical)) continue;
     mapped[logical] = (row as any)[attr.column];
   }
@@ -496,14 +540,20 @@ function buildFactBaseRelation(
   requiredAttributes: Set<string>
 ): RowSequence {
   const joinLookup = buildJoinLookup(model.joins);
-  const factRows = rowsToEnumerable(db.tables[baseFact] ?? []);
+  const normalizedFact = normalizeFact(baseFact, model.facts[baseFact]);
+  const factRows = rowsToEnumerable(db.tables[normalizedFact.table] ?? []);
 
   const factJoinKeys = model.joins
     .filter((edge) => edge.fact === baseFact)
     .map((edge) => edge.factKey);
 
   const factProjected = factRows.select((row: Row) => ({
-    ...mapLogicalAttributes(row, baseFact, model.attributes, requiredAttributes),
+    ...mapLogicalAttributes(
+      row,
+      normalizedFact.table,
+      model.attributes,
+      requiredAttributes
+    ),
     ...factJoinKeys.reduce((acc, key) => {
       acc[key] = (row as any)[key];
       return acc;
@@ -514,25 +564,39 @@ function buildFactBaseRelation(
   for (const attr of requiredAttributes) {
     const def = model.attributes[attr];
     if (!def) continue;
-    if (def.relation !== baseFact) {
-      neededRelations.add(def.relation);
+    if (def.table !== normalizedFact.table) {
+      neededRelations.add(def.table);
     }
   }
 
   let joined: RowSequence = factProjected;
 
-  neededRelations.forEach((relation) => {
-    const join = joinLookup.get(`${baseFact}|${relation}`);
+  neededRelations.forEach((table) => {
+    const dimensionId = Object.entries(model.dimensions).find(
+      ([_, def]) => normalizeDimension(_, def).table === table
+    )?.[0];
+    const join = joinLookup.get(`${baseFact}|${dimensionId}`);
     if (!join) {
       throw new Error(
-        `No join defined from fact ${baseFact} to dimension ${relation}`
+        `No join defined from fact ${baseFact} to dimension ${table}`
       );
     }
-    const dimensionRows = rowsToEnumerable(db.tables[relation] ?? []);
+    const normalizedDimension = normalizeDimension(
+      join.dimension,
+      model.dimensions[join.dimension]
+    );
+    const dimensionRows = rowsToEnumerable(
+      db.tables[normalizedDimension.table] ?? []
+    );
 
     const mappedDimension = dimensionRows.select((row: Row) => ({
       __joinKey: (row as any)[join.dimensionKey],
-      ...mapLogicalAttributes(row, relation, model.attributes, requiredAttributes),
+      ...mapLogicalAttributes(
+        row,
+        normalizedDimension.table,
+        model.attributes,
+        requiredAttributes
+      ),
     }));
 
     joined = joined.selectMany((factRow: Row) => {
@@ -558,12 +622,12 @@ function buildFactBaseRelation(
 function buildDimensionBaseRelation(
   model: SemanticModel,
   db: InMemoryDb,
-  relationName: string,
+  tableName: string,
   requiredAttributes: Set<string>
 ): RowSequence {
-  const rows = rowsToEnumerable(db.tables[relationName] ?? []);
+  const rows = rowsToEnumerable(db.tables[tableName] ?? []);
   return rows.select((row: Row) =>
-    mapLogicalAttributes(row, relationName, model.attributes, requiredAttributes)
+    mapLogicalAttributes(row, tableName, model.attributes, requiredAttributes)
   );
 }
 
@@ -868,11 +932,11 @@ function applyRowsetTransform(
   const allowedAnchor = new Set(targetAnchors);
 
   // 2. Filter the main joined+where-filtered relation to:
-  //    - rows whose factKey is in targetAnchors
+  //    - rows whose factAttr is in targetAnchors
   //    - rows that match all groupDimensions EXCEPT the anchorAttr (which is shifted)
   const relation = runtime.relation;
   return relation.where((row: Row) => {
-    if (!allowedAnchor.has((row as any)[transform.factKey])) return false;
+    if (!allowedAnchor.has((row as any)[transform.factAttr])) return false;
 
     return runtime.groupDimensions.every((dim) => {
       if (dim === transform.anchorAttr) return true; // this is the shifted dimension
@@ -978,8 +1042,12 @@ function factSupportsAllDimensions(
   return dimensions.every((dim) => {
     const attr = model.attributes[dim];
     if (!attr) return false;
-    if (attr.relation === fact) return true;
-    const joinKey = `${fact}|${attr.relation}`;
+    const normalizedFact = normalizeFact(fact, model.facts[fact]);
+    if (attr.table === normalizedFact.table) return true;
+    const dimensionId = Object.entries(model.dimensions).find(
+      ([id, def]) => normalizeDimension(id, def).table === attr.table
+    )?.[0];
+    const joinKey = `${fact}|${dimensionId}`;
     return model.joins.some((edge) => `${edge.fact}|${edge.dimension}` === joinKey);
   });
 }
@@ -1030,7 +1098,7 @@ function runSemanticQueryForBase(
     const relationsUsed = new Set<string>();
     requiredAttrs.forEach((attr) => {
       const def = model.attributes[attr];
-      if (def) relationsUsed.add(def.relation);
+      if (def) relationsUsed.add(def.table);
     });
 
     if (baseFact && !model.facts[baseFact]) {
@@ -1171,7 +1239,7 @@ export function runSemanticQuery(
     for (const attr of requiredAttrs) {
       const def = model.attributes[attr];
       if (!def) continue;
-      relationsUsed.add(def.relation);
+      relationsUsed.add(def.table);
     }
 
     if (relationsUsed.size === 0) {
@@ -1264,7 +1332,7 @@ export function runSemanticQuery(
     for (const attr of requiredAttrs) {
       const def = model.attributes[attr];
       if (!def) continue;
-      relationsUsed.add(def.relation);
+      relationsUsed.add(def.table);
     }
 
     if (relationsUsed.size === 1) {

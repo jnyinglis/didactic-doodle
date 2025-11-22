@@ -46,16 +46,12 @@ const db: InMemoryDb = {
 };
 
 const attributes: Record<string, LogicalAttribute> = {
-  storeId: { name: "storeId", relation: "dim_store", column: "id" },
-  month: { name: "month", relation: "fact_sales", column: "month" },
-  salesAmount: {
-    name: "salesAmount",
-    relation: "fact_sales",
-    column: "salesAmount",
-  },
-  onHand: { name: "onHand", relation: "fact_inventory", column: "onHand" },
-  storeName: { name: "storeName", relation: "dim_store", column: "storeName" },
-  week: { name: "week", relation: "dim_week", column: "id" },
+  storeId: { table: "dim_store", column: "id" },
+  month: { table: "fact_sales" },
+  salesAmount: { table: "fact_sales" },
+  onHand: { table: "fact_inventory" },
+  storeName: { table: "dim_store" },
+  week: { table: "dim_week", column: "id" },
 };
 
 const totalSales = aggregateMetric("totalSales", "fact_sales", "salesAmount", "sum");
@@ -78,11 +74,11 @@ const storeNameLength: MetricDefinition = {
 
 const model: SemanticModel = {
   facts: {
-    fact_sales: { name: "fact_sales" },
-    fact_inventory: { name: "fact_inventory" },
-    fact_budget: { name: "fact_budget" },
+    fact_sales: { table: "fact_sales" },
+    fact_inventory: { table: "fact_inventory" },
+    fact_budget: { table: "fact_budget" },
   },
-  dimensions: { dim_store: { name: "dim_store" }, dim_week: { name: "dim_week" } },
+  dimensions: { dim_store: { table: "dim_store" }, dim_week: { table: "dim_week" } },
   attributes,
   joins: [
     { fact: "fact_sales", dimension: "dim_store", factKey: "storeId", dimensionKey: "id" },
@@ -255,19 +251,18 @@ describe("metric expression compiler", () => {
     });
 
     const model: SemanticModel = {
-      facts: { fact_sales: { name: "fact_sales" } },
+      facts: { fact_sales: { table: "fact_sales" } },
       dimensions: {},
       attributes: {},
       joins: [],
       metrics: { sum_sales: sumSales },
       rowsetTransforms: {
         "last_year:tradyrwkcode": {
-          id: "last_year:tradyrwkcode",
           table: "tradyrwk_transform",
           anchorAttr: "tradyrwkcode",
           fromColumn: "tradyrwkcode",
           toColumn: "tradyrwkcode_lastyear",
-          factKey: "tradyrwkcode",
+          factAttr: "tradyrwkcode",
         },
       },
     };
@@ -293,7 +288,7 @@ describe("metric expression compiler", () => {
         .toArray();
       const allowed = new Set(targetAnchors);
       return runtime.relation.where(
-        (row: any) => allowed.has(row[transform.factKey])
+        (row: any) => allowed.has(row[transform.factAttr])
       );
     };
 
