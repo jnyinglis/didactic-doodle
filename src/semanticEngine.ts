@@ -602,6 +602,37 @@ function evalBinary(
 }
 
 export function compileMetricExpr(expr: MetricExpr): MetricEvalV2 {
+  function validate(node: MetricExpr): void {
+    if (node.kind === "Call") {
+      const fn = node.fn.toLowerCase();
+      if (["sum", "avg", "min", "max", "count"].includes(fn)) {
+        if (node.args.length !== 1 || node.args[0].kind !== "AttrRef") {
+          throw new Error(`${fn}() expects a single attribute reference argument`);
+        }
+      } else if (fn === "last_year") {
+        const [metricArg, anchorArg] = node.args;
+        if (node.args.length !== 2) {
+          throw new Error("last_year() expects a metric reference and anchor attribute");
+        }
+        if (!metricArg || metricArg.kind !== "MetricRef") {
+          throw new Error("last_year() first argument must be a MetricRef");
+        }
+        if (!anchorArg || anchorArg.kind !== "AttrRef") {
+          throw new Error("last_year() second argument must be an AttrRef");
+        }
+      }
+    }
+
+    if (node.kind === "BinaryOp") {
+      validate(node.left);
+      validate(node.right);
+    } else if (node.kind === "Call") {
+      node.args.forEach(validate);
+    }
+  }
+
+  validate(expr);
+
   const evaluator = (node: MetricExpr, ctx: MetricComputationContext): number | undefined => {
     switch (node.kind) {
       case "Literal":
@@ -620,28 +651,26 @@ export function compileMetricExpr(expr: MetricExpr): MetricEvalV2 {
         const fn = node.fn.toLowerCase();
         if (["sum", "avg", "min", "max", "count"].includes(fn)) {
           const [arg] = node.args;
-          const attr = arg?.kind === "AttrRef" ? arg.name : null;
-          const effectiveAttr = fn === "count" && (attr === null || attr === "*") ? null : attr;
-          return aggregateRows(ctx.rows, effectiveAttr, fn as AggregationOperator);
+          const attr = (arg as any).name as string;
+          if (fn === "count" && attr === "*") {
+            return aggregateRows(ctx.rows, null, "count");
+          }
+          return aggregate(ctx.rows, attr, fn as AggregationOperator);
         }
         if (fn === "last_year") {
-          const metricArg = node.args[0];
-          if (metricArg?.kind !== "MetricRef") return undefined;
-          const cacheLabel = `last_year(${metricArg.name})`;
-          const transformed = ctx.helpers.applyRowsetTransform("last_year", ctx.groupKey);
+          const [metricArg, anchorArg] = node.args;
+          const transformId = `last_year:${(anchorArg as any).name}`;
+          const cacheLabel = `last_year(${(metricArg as any).name})`;
+          const transformed = ctx.helpers.applyRowsetTransform(transformId, ctx.groupKey);
           return evaluateMetricRuntime(
-            metricArg.name,
+            (metricArg as any).name,
             ctx.helpers.runtime,
             ctx.groupKey,
             transformed,
             cacheLabel
           );
         }
-        const evaluatedArgs = node.args.map((a) => evaluator(a, ctx) ?? 0);
-        if (fn === "last_year" && evaluatedArgs.length === 1) {
-          return evaluatedArgs[0];
-        }
-        return undefined;
+        throw new Error(`Unknown function: ${node.fn}`);
       }
     }
   };
@@ -653,11 +682,13 @@ export function buildMetricFromExpr(opts: {
   name: string;
   baseFact?: string;
   expr: MetricExpr;
+  description?: string;
 }): MetricDefinitionV2 {
   const { attrs, deps } = collectAttrsAndDeps(opts.expr);
   return {
     name: opts.name,
     baseFact: opts.baseFact,
+    description: opts.description,
     attributes: Array.from(attrs),
     deps: Array.from(deps),
     exprAst: opts.expr,
@@ -949,7 +980,7 @@ export function runSemanticQuery(
         model,
         db,
         baseFact: undefined,
-        relation: group,
+        relation: relation,
         whereFilter: whereNode,
         groupDimensions: dimensions,
       };
@@ -1023,7 +1054,7 @@ export function runSemanticQuery(
       model,
       db,
       baseFact: primaryFact,
-      relation: group,
+      relation: frameRelation,
       whereFilter: whereNode,
       groupDimensions: dimensions,
     };
@@ -1086,7 +1117,7 @@ export function runSemanticQuery(
         model,
         db,
         baseFact: fact,
-        relation: group,
+        relation: factRelation,
         whereFilter: whereNode,
         groupDimensions: dimensions,
       };
@@ -1129,7 +1160,7 @@ export function runSemanticQuery(
         model,
         db,
         baseFact: undefined,
-        relation: group,
+        relation: frameRelation,
         whereFilter: whereNode,
         groupDimensions: dimensions,
       };
