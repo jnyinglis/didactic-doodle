@@ -1,9 +1,10 @@
 import {
-  MetricDefAst,
-  buildMetricDefinition,
-  metricDef,
+  MetricDeclAst,
+  metricDecl,
   parseAll,
-  queryDef,
+  queryDecl,
+  resolveMetricRefs,
+  validateMetricExpr,
 } from "./dsl";
 import {
   InMemoryDb,
@@ -14,16 +15,17 @@ import {
   SemanticModel,
   runSemanticQuery,
 } from "./semanticEngine";
+import { buildMetricFromExpr } from "./semanticEngine";
 
-function parseMetricBlock(source: string): MetricDefAst[] {
-  const defs: MetricDefAst[] = [];
+function parseMetricBlock(source: string): MetricDeclAst[] {
+  const defs: MetricDeclAst[] = [];
   let pos = 0;
 
   while (pos < source.length) {
     const remaining = source.slice(pos);
     if (!remaining.trim()) break;
 
-    const next = metricDef.parse(source, pos);
+    const next = metricDecl(source, pos);
     if (!next) {
       throw new Error(`Could not parse metric definition near: ${remaining.slice(0, 80)}`);
     }
@@ -34,10 +36,16 @@ function parseMetricBlock(source: string): MetricDefAst[] {
   return defs;
 }
 
-function compileMetrics(metricAsts: MetricDefAst[]): MetricRegistry {
+function compileMetrics(metricAsts: MetricDeclAst[]): MetricRegistry {
   const metricNames = new Set(metricAsts.map((m) => m.name));
   return metricAsts.reduce<MetricRegistry>((registry, ast) => {
-    const compiled = buildMetricDefinition(ast, metricNames) as MetricDefinition;
+    const resolved = resolveMetricRefs(ast.expr, metricNames);
+    validateMetricExpr(resolved);
+    const compiled = buildMetricFromExpr({
+      name: ast.name,
+      baseFact: ast.baseFact,
+      expr: resolved,
+    }) as MetricDefinition;
     registry[compiled.name] = compiled;
     return registry;
   }, {});
@@ -123,7 +131,7 @@ query weekly_sales {
     metrics,
   };
 
-  const spec: QuerySpec = parseAll(queryDef, queryText).spec;
+  const spec: QuerySpec = parseAll(queryDecl, queryText).spec;
   const rows = runSemanticQuery({ db, model }, spec);
 
   console.log("DSL metrics parsed:");
