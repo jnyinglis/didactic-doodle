@@ -11,9 +11,9 @@ This spec elaborates the design, key changes, data migrations, testing plans, an
 ## Progress Checklist
 
 ### Objective 1 — Adopt `linq.js`
-- [x] Bundled `Enumerable` is imported inside `semanticEngineV2.ts` along with the `rowsToEnumerable` helper so every caller works with fluent LINQ sequences. 【F:src/semanticEngineV2.ts†L12-L22】
-- [x] The bespoke `RowSequence` implementation has been removed in favor of the `Enumerable` return type, and all callers (`applyContextToTable`, metric evaluators, transforms) now operate directly on those sequences. 【F:src/semanticEngineV2.ts†L12-L22】【F:src/semanticEngineV2.ts†L308-L314】
-- [x] Execution paths such as `applyContextToTable` and the relational query runner (`runRelationalQuery`) return `Enumerable` instances and compose `where`, `select`, `groupBy`, and aggregate helpers instead of mutating arrays. 【F:src/semanticEngineV2.ts†L316-L368】【F:src/semanticEngineV2.ts†L801-L976】
+- [x] Bundled `Enumerable` is imported inside `semanticEngine.ts` along with the `rowsToEnumerable` helper so every caller works with fluent LINQ sequences. 【F:src/semanticEngine.ts†L12-L22】
+- [x] The bespoke `RowSequence` implementation has been removed in favor of the `Enumerable` return type, and all callers (`applyContextToTable`, metric evaluators, transforms) now operate directly on those sequences. 【F:src/semanticEngine.ts†L12-L22】【F:src/semanticEngine.ts†L308-L314】
+- [x] Execution paths such as `applyContextToTable` and the relational query runner (`runRelationalQuery`) return `Enumerable` instances and compose `where`, `select`, `groupBy`, and aggregate helpers instead of mutating arrays. 【F:src/semanticEngine.ts†L316-L368】【F:src/semanticEngine.ts†L801-L976】
 - [x] The repository ships with `src/linq.d.ts`, providing the typings required for the imported operators to satisfy TypeScript. 【F:src/linq.d.ts†L1-L62】
 - [ ] Add additional regression coverage that specifically exercises the newly available LINQ helpers (e.g., joins, ordering, nested groupings) beyond the existing unit tests.
 
@@ -30,9 +30,9 @@ This spec elaborates the design, key changes, data migrations, testing plans, an
 - [ ] Resolve the open architectural questions (relationship declaration model, multi-table join scope, handling duplicate measures) and codify the decisions in this spec.
 
 ## Current State Summary
-- `src/semanticEngineV2.ts` exports the grain-agnostic runtime, bundled LINQ helpers, and the `runSemanticQuery` entry point now used throughout the repository. 【F:src/semanticEngineV2.ts†L1-L33】【F:src/semanticEngineV2.ts†L801-L976】
-- Row operations operate directly on `Enumerable` sequences, enabling composable filtering, grouping, and aggregation without the legacy `RowSequence` shim. 【F:src/semanticEngineV2.ts†L12-L22】【F:src/semanticEngineV2.ts†L308-L368】
-- Demo and test coverage focus exclusively on the V2 engine rather than the superseded semanticEngine prototype. 【F:src/semanticEngineDemoV2.ts†L8-L58】【F:test/semanticEngineV2.test.ts†L1-L82】
+- `src/semanticEngine.ts` exports the grain-agnostic runtime, bundled LINQ helpers, and the `runSemanticQuery` entry point now used throughout the repository. 【F:src/semanticEngine.ts†L1-L33】【F:src/semanticEngine.ts†L801-L976】
+- Row operations operate directly on `Enumerable` sequences, enabling composable filtering, grouping, and aggregation without the legacy `RowSequence` shim. 【F:src/semanticEngine.ts†L12-L22】【F:src/semanticEngine.ts†L308-L368】
+- Demo and test coverage focus exclusively on the engine rather than the superseded semanticEngine prototype. 【F:src/semanticEngineDemo.ts†L8-L58】【F:test/semanticEngine.test.ts†L1-L82】
 
 ## Objective 1 — Adopt `linq.js`
 ### Design Goals
@@ -42,7 +42,7 @@ This spec elaborates the design, key changes, data migrations, testing plans, an
 
 ### Key Changes
 1. **Import & Wire `Enumerable`:**
-   - Import the default export from `src/linq.js` inside `semanticEngineV2.ts`.
+   - Import the default export from `src/linq.js` inside `semanticEngine.ts`.
    - Provide a helper (`rowsToEnumerable(rows: Row[]): Enumerable<Row>`) to centralize instantiation.
 
 2. **Remove `RowSequence`:**
