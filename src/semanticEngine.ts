@@ -458,16 +458,23 @@ export const Expr = {
   },
 };
 
-export function collectAttrsAndDeps(expr: MetricExpr): {
+export interface MetricReferenceSummary {
   attrs: Set<string>;
   deps: Set<string>;
-} {
+  literals: number[];
+  transforms: Set<string>;
+}
+
+export function collectMetricReferences(expr: MetricExpr): MetricReferenceSummary {
   const attrs = new Set<string>();
   const deps = new Set<string>();
+  const transforms = new Set<string>();
+  const literals: number[] = [];
 
   function walk(e: MetricExpr) {
     switch (e.kind) {
       case "Literal":
+        literals.push(e.value);
         return;
       case "AttrRef":
         attrs.add(e.name);
@@ -475,9 +482,14 @@ export function collectAttrsAndDeps(expr: MetricExpr): {
       case "MetricRef":
         deps.add(e.name);
         return;
-      case "Call":
+      case "Call": {
+        const fn = e.fn.toLowerCase();
+        if (fn === "last_year" && e.args[1]?.kind === "AttrRef") {
+          transforms.add(`last_year:${(e.args[1] as any).name}`);
+        }
         e.args.forEach(walk);
         return;
+      }
       case "BinaryOp":
         walk(e.left);
         walk(e.right);
@@ -486,6 +498,14 @@ export function collectAttrsAndDeps(expr: MetricExpr): {
   }
 
   walk(expr);
+  return { attrs, deps, literals, transforms };
+}
+
+export function collectAttrsAndDeps(expr: MetricExpr): {
+  attrs: Set<string>;
+  deps: Set<string>;
+} {
+  const { attrs, deps } = collectMetricReferences(expr);
   return { attrs, deps };
 }
 
@@ -957,6 +977,257 @@ export function rowsetTransformMetric(opts: {
       return value;
     },
   };
+}
+
+/* --------------------------------------------------------------------------
+ * STATIC ANALYSIS + VALIDATION
+ * -------------------------------------------------------------------------- */
+
+export interface ValidationIssue {
+  metric: string;
+  message: string;
+  path?: string[];
+  suggestion?: string;
+}
+
+export interface ValidationResult {
+  metric: string;
+  ok: boolean;
+  errors: ValidationIssue[];
+}
+
+function isAttributeReachable(
+  baseFact: string,
+  attrName: string,
+  model: SemanticModel
+): boolean {
+  const attr = model.attributes[attrName];
+  if (!attr) return false;
+
+  const normalizedFact = normalizeFact(baseFact, model.facts[baseFact]);
+  if (attr.table === normalizedFact.table) return true;
+
+  const dimensionId = Object.entries(model.dimensions).find(
+    ([id, def]) => normalizeDimension(id, def).table === attr.table
+  )?.[0];
+  if (!dimensionId) return false;
+
+  return model.joins.some(
+    (edge) => edge.fact === baseFact && edge.dimension === dimensionId
+  );
+}
+
+function collectDependencyGraph(model: SemanticModel): Map<string, string[]> {
+  const graph = new Map<string, string[]>();
+
+  for (const [name, metric] of Object.entries(model.metrics)) {
+    let deps: string[] = [];
+    if ((metric as MetricDefinitionV2).exprAst) {
+      const refs = collectMetricReferences((metric as MetricDefinitionV2).exprAst!);
+      deps = Array.from(refs.deps);
+    } else if (metric.deps) {
+      deps = metric.deps;
+    }
+    graph.set(name, deps);
+  }
+
+  return graph;
+}
+
+function detectCircularDependencies(
+  model: SemanticModel
+): Map<string, string[]> {
+  const graph = collectDependencyGraph(model);
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const cycles = new Map<string, string[]>();
+
+  function dfs(node: string, stack: string[]) {
+    if (visited.has(node)) return;
+    if (visiting.has(node)) {
+      const idx = stack.indexOf(node);
+      const cycle = stack.slice(idx).concat(node);
+      cycle.forEach((m) => cycles.set(m, cycle));
+      return;
+    }
+
+    visiting.add(node);
+    const deps = graph.get(node) ?? [];
+    deps.forEach((dep) => dfs(dep, [...stack, node]));
+    visiting.delete(node);
+    visited.add(node);
+  }
+
+  for (const metric of graph.keys()) {
+    if (!visited.has(metric)) {
+      dfs(metric, []);
+    }
+  }
+
+  return cycles;
+}
+
+function metricReferences(
+  metric: MetricDefinition | MetricDefinitionV2
+): MetricReferenceSummary {
+  if ((metric as MetricDefinitionV2).exprAst) {
+    return collectMetricReferences((metric as MetricDefinitionV2).exprAst!);
+  }
+
+  return {
+    attrs: new Set(metric.attributes ?? []),
+    deps: new Set(metric.deps ?? []),
+    literals: [],
+    transforms: new Set<string>(),
+  };
+}
+
+export function validateMetric(
+  model: SemanticModel,
+  metricName: string
+): ValidationResult {
+  const metric = model.metrics[metricName];
+  const errors: ValidationIssue[] = [];
+
+  if (!metric) {
+    return {
+      metric: metricName,
+      ok: false,
+      errors: [
+        {
+          metric: metricName,
+          message: `Metric "${metricName}" is not defined`,
+        },
+      ],
+    };
+  }
+
+  const refs = metricReferences(metric as MetricDefinitionV2);
+
+  if ((metric as MetricDefinitionV2).exprAst) {
+    for (const dep of refs.deps) {
+      if (!model.metrics[dep]) {
+        errors.push({
+          metric: metricName,
+          message: `Metric "${metricName}" references unknown metric "${dep}"`,
+          suggestion: "Declare the metric dependency or fix the reference name.",
+        });
+      }
+    }
+  }
+
+  const baseFact = metric.baseFact;
+
+  refs.attrs.forEach((attr) => {
+    if (!model.attributes[attr]) {
+      errors.push({
+        metric: metricName,
+        message: `Metric "${metricName}" references unknown attribute "${attr}"`,
+        suggestion: "Add the attribute to the semantic model or correct the reference.",
+      });
+      return;
+    }
+
+    if (baseFact) {
+      const reachable = isAttributeReachable(baseFact, attr, model);
+      if (!reachable) {
+        errors.push({
+          metric: metricName,
+          message: `Attribute "${attr}" is not reachable from base fact "${baseFact}"`,
+          suggestion: "Add a join to connect the attribute's table to the base fact or choose a compatible base fact.",
+        });
+      }
+    }
+  });
+
+  if (!baseFact) {
+    const attrTables = new Set(
+      Array.from(refs.attrs)
+        .map((a) => model.attributes[a]?.table)
+        .filter((t): t is string => Boolean(t))
+    );
+
+    if (attrTables.size > 1) {
+      errors.push({
+        metric: metricName,
+        message: `Metric "${metricName}" mixes attributes from multiple relations without declaring a base fact`,
+        suggestion: "Set baseFact or limit the metric to a single relation.",
+      });
+    }
+  }
+
+  if (baseFact && refs.deps.size) {
+    refs.deps.forEach((dep) => {
+      const depBase = model.metrics[dep]?.baseFact;
+      if (depBase && depBase !== baseFact) {
+        errors.push({
+          metric: metricName,
+          message: `Metric "${metricName}" depends on cross-fact metric "${dep}" (${depBase})`,
+          suggestion: "Align baseFact across dependent metrics or split the computation.",
+        });
+      }
+    });
+  }
+
+  refs.transforms.forEach((transformId) => {
+    const transform = model.rowsetTransforms?.[transformId];
+    if (!transform) {
+      errors.push({
+        metric: metricName,
+        message: `Transform "${transformId}" is not defined for metric "${metricName}"`,
+        suggestion: "Add the rowset transform configuration to the semantic model.",
+      });
+      return;
+    }
+
+    if (!model.attributes[transform.anchorAttr]) {
+      errors.push({
+        metric: metricName,
+        message: `Transform anchor attribute "${transform.anchorAttr}" is not in the semantic model`,
+        suggestion: "Define the anchor attribute so it can be used for period shifting.",
+      });
+    }
+
+    if (!model.attributes[transform.factAttr]) {
+      errors.push({
+        metric: metricName,
+        message: `Transform fact attribute "${transform.factAttr}" is not in the semantic model`,
+        suggestion: "Define the fact attribute or correct the transform configuration.",
+      });
+    }
+
+    if (baseFact && !isAttributeReachable(baseFact, transform.factAttr, model)) {
+      errors.push({
+        metric: metricName,
+        message: `Transform fact attribute "${transform.factAttr}" is not reachable from base fact "${baseFact}"`,
+        suggestion: "Ensure the transform's fact attribute belongs to the metric's base fact or add the necessary join.",
+      });
+    }
+  });
+
+  return { metric: metricName, ok: errors.length === 0, errors };
+}
+
+export function validateAll(model: SemanticModel): ValidationResult[] {
+  const cycles = detectCircularDependencies(model);
+  const results: ValidationResult[] = [];
+
+  for (const metricName of Object.keys(model.metrics)) {
+    const result = validateMetric(model, metricName);
+    const cyclePath = cycles.get(metricName);
+    if (cyclePath) {
+      result.errors.push({
+        metric: metricName,
+        message: `Circular dependency detected: ${cyclePath.join(" -> ")}`,
+        path: cyclePath,
+        suggestion: "Break the cycle by removing the recursive reference or introducing a base metric.",
+      });
+    }
+    result.ok = result.errors.length === 0;
+    results.push(result);
+  }
+
+  return results;
 }
 
 function applyRowsetTransform(

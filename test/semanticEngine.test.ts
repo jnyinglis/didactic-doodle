@@ -16,6 +16,9 @@ import {
   rowsToEnumerable,
   runSemanticQuery,
   f,
+  validateMetric,
+  validateAll,
+  lastYearMetric,
 } from "../src/semanticEngine";
 
 const db: InMemoryDb = {
@@ -117,6 +120,23 @@ const model: SemanticModel = {
   },
 };
 
+const validationModelBase: SemanticModel = {
+  facts: { fact_sales: { table: "fact_sales" }, fact_inventory: { table: "fact_inventory" } },
+  dimensions: { dim_store: { table: "dim_store" }, dim_week: { table: "dim_week" } },
+  attributes: {
+    storeId: { table: "dim_store", column: "id" },
+    salesAmount: { table: "fact_sales" },
+    onHand: { table: "fact_inventory" },
+    week: { table: "dim_week", column: "id" },
+    unreachableAttr: { table: "dim_unreachable", column: "id" },
+  },
+  joins: [
+    { fact: "fact_sales", dimension: "dim_store", factKey: "storeId", dimensionKey: "id" },
+    { fact: "fact_sales", dimension: "dim_week", factKey: "week", dimensionKey: "id" },
+  ],
+  metrics: {},
+};
+
 describe("metric builders", () => {
   it("creates aggregate metrics backed by MetricExpr", () => {
     const metric = aggregateMetric("avgSales", "fact_sales", "salesAmount", "avg");
@@ -125,6 +145,91 @@ describe("metric builders", () => {
     expect(metric.attributes).to.deep.equal(["salesAmount"]);
     expect(metric.deps).to.deep.equal([]);
     expect(metric.baseFact).to.equal("fact_sales");
+  });
+});
+
+describe("static analysis + validation", () => {
+  it("flags attributes that are unreachable from the declared base fact", () => {
+    const unreachableMetric = buildMetricFromExpr({
+      name: "badAttrMetric",
+      baseFact: "fact_sales",
+      expr: Expr.sum("unreachableAttr"),
+    });
+
+    const model: SemanticModel = {
+      ...validationModelBase,
+      metrics: { badAttrMetric: unreachableMetric },
+    };
+
+    const result = validateMetric(model, "badAttrMetric");
+
+    expect(result.ok).to.be.false;
+    expect(result.errors[0].message).to.include("not reachable");
+  });
+
+  it("detects circular metric dependencies", () => {
+    const metricA = buildMetricFromExpr({
+      name: "metricA",
+      baseFact: "fact_sales",
+      expr: Expr.add(Expr.metric("metricB"), Expr.lit(1)),
+    });
+
+    const metricB = buildMetricFromExpr({
+      name: "metricB",
+      baseFact: "fact_sales",
+      expr: Expr.add(Expr.metric("metricA"), Expr.lit(1)),
+    });
+
+    const model: SemanticModel = {
+      ...validationModelBase,
+      metrics: { metricA, metricB },
+    };
+
+    const results = validateAll(model);
+    const metricAIssues = results.find((r) => r.metric === "metricA")?.errors ?? [];
+    const messages = metricAIssues.map((e) => e.message).join(" ");
+
+    expect(messages).to.include("Circular dependency");
+  });
+
+  it("flags missing rowset transform definitions", () => {
+    const lastYear = lastYearMetric("salesLastYear", "fact_sales", "totalSales", "week");
+
+    const model: SemanticModel = {
+      ...validationModelBase,
+      metrics: { totalSales, salesLastYear: lastYear },
+    };
+
+    const result = validateMetric(model, "salesLastYear");
+
+    expect(result.ok).to.be.false;
+    expect(result.errors.some((e) => e.message.includes("Transform"))).to.be.true;
+  });
+
+  it("prevents cross-fact metric dependencies", () => {
+    const salesMetric = aggregateMetric("sales", "fact_sales", "salesAmount", "sum");
+    const inventoryMetric = aggregateMetric(
+      "inventory",
+      "fact_inventory",
+      "onHand",
+      "sum"
+    );
+
+    const mixedMetric = buildMetricFromExpr({
+      name: "mixed",
+      baseFact: "fact_sales",
+      expr: Expr.add(Expr.metric("sales"), Expr.metric("inventory")),
+    });
+
+    const model: SemanticModel = {
+      ...validationModelBase,
+      metrics: { sales: salesMetric, inventory: inventoryMetric, mixed: mixedMetric },
+    };
+
+    const result = validateMetric(model, "mixed");
+
+    expect(result.ok).to.be.false;
+    expect(result.errors.some((e) => e.message.includes("cross-fact"))).to.be.true;
   });
 });
 
