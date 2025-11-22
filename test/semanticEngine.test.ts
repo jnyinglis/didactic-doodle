@@ -7,6 +7,7 @@ import {
   MetricComputationContext,
   MetricRuntime,
   MetricExpr,
+  Expr,
   QuerySpec,
   SemanticModel,
   buildMetricFromExpr,
@@ -48,13 +49,8 @@ const attributes: Record<string, LogicalAttribute> = {
   storeName: { name: "storeName", relation: "dim_store", column: "storeName" },
 };
 
-const totalSales = aggregateMetric("totalSales", "salesAmount", "sum", "fact_sales");
-const totalOnHand = aggregateMetric(
-  "totalOnHand",
-  "onHand",
-  "sum",
-  "fact_inventory"
-);
+const totalSales = aggregateMetric("totalSales", "fact_sales", "salesAmount", "sum");
+const totalOnHand = aggregateMetric("totalOnHand", "fact_inventory", "onHand", "sum");
 
 const storeNameLength: MetricDefinition = {
   name: "storeNameLength",
@@ -84,6 +80,17 @@ const model: SemanticModel = {
     storeNameLength,
   },
 };
+
+describe("metric builders", () => {
+  it("creates aggregate metrics backed by MetricExpr", () => {
+    const metric = aggregateMetric("avgSales", "fact_sales", "salesAmount", "avg");
+
+    expect(metric.exprAst).to.deep.equal(Expr.avg("salesAmount"));
+    expect(metric.attributes).to.deep.equal(["salesAmount"]);
+    expect(metric.deps).to.deep.equal([]);
+    expect(metric.baseFact).to.equal("fact_sales");
+  });
+});
 
 describe("semanticEngine multi-fact", () => {
   it("evaluates metrics per fact and joins by dimensions", () => {

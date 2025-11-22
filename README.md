@@ -68,8 +68,8 @@ const model: SemanticModel = {
     { fact: "fact_returns", dimension: "dim_store", factKey: "storeId", dimensionKey: "id" },
   ],
   metrics: {
-    totalSales: aggregateMetric("totalSales", "amount", "sum", "fact_orders"),
-    totalRefunds: aggregateMetric("totalRefunds", "refund", "sum", "fact_returns"),
+    totalSales: aggregateMetric("totalSales", "fact_orders", "amount", "sum"),
+    totalRefunds: aggregateMetric("totalRefunds", "fact_returns", "refund", "sum"),
   },
 };
 
