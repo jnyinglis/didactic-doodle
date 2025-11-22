@@ -4,7 +4,8 @@
   "description": "Semantic Metrics Engine — Proof-of-Concept Design",
   "main": "index.js",
   "scripts": {
-    "test": "mocha -r ts-node/register 'test/**/*.test.ts'"
+    "test": "mocha -r ts-node/register 'test/**/*.test.ts'",
+    "dsl-demo": "ts-node src/dslDemo.ts"
   },
   "keywords": [],
   "author": "",
