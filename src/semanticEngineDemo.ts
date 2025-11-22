@@ -13,17 +13,20 @@ import {
 
 function runSemanticEngineDemo() {
   const attributes: Record<string, LogicalAttribute> = {
-    orderId: { name: "orderId", relation: "fact_orders", column: "orderId" },
-    storeId: { name: "storeId", relation: "fact_orders", column: "storeId" },
-    storeName: { name: "storeName", relation: "dim_store", column: "storeName" },
-    region: { name: "region", relation: "dim_store", column: "region" },
-    amount: { name: "amount", relation: "fact_orders", column: "amount" },
-    refund: { name: "refund", relation: "fact_returns", column: "refund" },
-    salesWeek: { name: "salesWeek", relation: "dim_week", column: "code" },
-    weekLabel: { name: "weekLabel", relation: "dim_week", column: "label" },
-    weekCode: { name: "weekCode", relation: "fact_orders", column: "weekCode" },
-    weekCodeReturns: { name: "weekCodeReturns", relation: "fact_returns", column: "weekCode" },
-    channel: { name: "channel", relation: "fact_orders", column: "channel" },
+    orderId: { table: "fact_orders" },
+    storeId: { table: "fact_orders" },
+    amount: { table: "fact_orders" },
+    weekCode: { table: "fact_orders" },
+    channel: { table: "fact_orders" },
+
+    refund: { table: "fact_returns" },
+    weekCodeReturns: { table: "fact_returns", column: "weekCode" },
+
+    storeName: { table: "dim_store" },
+    region: { table: "dim_store" },
+
+    salesWeek: { table: "dim_week", column: "code" },
+    weekLabel: { table: "dim_week", column: "label" },
   };
 
   const db: InMemoryDb = {
@@ -68,12 +71,12 @@ function runSemanticEngineDemo() {
 
   const model: SemanticModel = {
     facts: {
-      fact_orders: { name: "fact_orders" },
-      fact_returns: { name: "fact_returns" },
+      fact_orders: { table: "fact_orders" },
+      fact_returns: { table: "fact_returns" },
     },
     dimensions: {
-      dim_store: { name: "dim_store" },
-      dim_week: { name: "dim_week" },
+      dim_store: { table: "dim_store" },
+      dim_week: { table: "dim_week" },
     },
     attributes,
     joins: [
