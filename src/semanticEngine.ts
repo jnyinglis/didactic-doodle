@@ -321,6 +321,34 @@ export interface RowsetTransformDefinition {
   factAttr: string;
 }
 
+export interface TableTransformMappingRow {
+  key: any;
+  mappedKey: any;
+}
+
+export interface TableTransformDefinition {
+  /** Inline two-column mapping table. */
+  table?: TableTransformMappingRow[];
+
+  /** Physical relation name containing the transform mapping. */
+  relation?: string;
+
+  /** Column name for the input key when using a relation. Defaults to "key". */
+  keyColumn?: string;
+
+  /** Column name for the mapped key when using a relation. Defaults to "mappedKey". */
+  mappedColumn?: string;
+
+  /** Attribute ID used as the input anchor (e.g. week). */
+  inputAttr: string;
+
+  /** Attribute ID used to filter fact rows after mapping. */
+  outputAttr: string;
+
+  /** Optional fallback mapped key when no match is found. */
+  fallbackMappedKey?: any;
+}
+
 export interface SemanticModel {
   facts: Record<string, FactDefinition>;
   dimensions: Record<string, DimensionDefinition>;
@@ -328,6 +356,7 @@ export interface SemanticModel {
   joins: JoinEdge[];
   metrics: MetricRegistry;
   rowsetTransforms?: Record<string, RowsetTransformDefinition>;
+  tableTransforms?: Record<string, TableTransformDefinition>;
 }
 
 /* --------------------------------------------------------------------------
@@ -383,6 +412,10 @@ export interface MetricComputationHelpers {
     transformId: string,
     groupKey: Record<string, any>
   ): RowSequence;
+  applyTableTransform(
+    transformId: string,
+    groupKey: Record<string, any>
+  ): RowSequence;
   bind(name: string): any;
 }
 
@@ -400,6 +433,14 @@ export type MetricExpr =
       op: "+" | "-" | "*" | "/";
       left: MetricExpr;
       right: MetricExpr;
+    }
+  | {
+      kind: "Transform";
+      transformId: string;
+      transformKind: "table";
+      base: MetricExpr;
+      inputAttr?: string;
+      outputAttr?: string;
     };
 
 export const Expr = {
@@ -456,6 +497,22 @@ export const Expr = {
   lastYear(metricName: string, anchorAttr: string): MetricExpr {
     return this.call("last_year", this.metric(metricName), this.attr(anchorAttr));
   },
+
+  tableTransform(
+    metricName: string,
+    transformId: string,
+    inputAttr?: string,
+    outputAttr?: string
+  ): MetricExpr {
+    return {
+      kind: "Transform",
+      transformId,
+      transformKind: "table",
+      base: this.metric(metricName),
+      inputAttr,
+      outputAttr,
+    } as MetricExpr;
+  },
 };
 
 export interface MetricReferenceSummary {
@@ -463,12 +520,14 @@ export interface MetricReferenceSummary {
   deps: Set<string>;
   literals: number[];
   transforms: Set<string>;
+  tableTransforms: Set<string>;
 }
 
 export function collectMetricReferences(expr: MetricExpr): MetricReferenceSummary {
   const attrs = new Set<string>();
   const deps = new Set<string>();
   const transforms = new Set<string>();
+  const tableTransforms = new Set<string>();
   const literals: number[] = [];
 
   function walk(e: MetricExpr) {
@@ -481,6 +540,12 @@ export function collectMetricReferences(expr: MetricExpr): MetricReferenceSummar
         return;
       case "MetricRef":
         deps.add(e.name);
+        return;
+      case "Transform":
+        tableTransforms.add(e.transformId);
+        if (e.inputAttr) attrs.add(e.inputAttr);
+        if (e.outputAttr) attrs.add(e.outputAttr);
+        walk(e.base);
         return;
       case "Call": {
         const fn = e.fn.toLowerCase();
@@ -498,7 +563,7 @@ export function collectMetricReferences(expr: MetricExpr): MetricReferenceSummar
   }
 
   walk(expr);
-  return { attrs, deps, literals, transforms };
+  return { attrs, deps, literals, transforms, tableTransforms };
 }
 
 export function collectAttrsAndDeps(expr: MetricExpr): {
@@ -822,6 +887,8 @@ export function compileMetricExpr(expr: MetricExpr): MetricEvalV2 {
       validate(node.right);
     } else if (node.kind === "Call") {
       node.args.forEach(validate);
+    } else if (node.kind === "Transform") {
+      validate(node.base);
     }
   }
 
@@ -835,6 +902,26 @@ export function compileMetricExpr(expr: MetricExpr): MetricEvalV2 {
         return Number(ctx.groupKey[node.name]);
       case "MetricRef":
         return ctx.evalMetric(node.name);
+      case "Transform": {
+        if (node.transformKind === "table") {
+          const cacheLabel = `${node.transformId}:transform`;
+          const transformed = ctx.helpers.applyTableTransform(
+            node.transformId,
+            ctx.groupKey
+          );
+          if (node.base.kind !== "MetricRef") {
+            throw new Error("Table transforms currently require a MetricRef base");
+          }
+          return evaluateMetricRuntime(
+            node.base.name,
+            ctx.helpers.runtime,
+            ctx.groupKey,
+            transformed,
+            cacheLabel
+          );
+        }
+        return undefined;
+      }
       case "BinaryOp":
         return evalBinary(
           node.op,
@@ -979,6 +1066,74 @@ export function rowsetTransformMetric(opts: {
   };
 }
 
+export function defineTableTransform(opts: {
+  name: string;
+  table: TableTransformMappingRow[];
+  inputAttr: string;
+  outputAttr: string;
+  fallbackMappedKey?: any;
+}): { name: string; definition: TableTransformDefinition } {
+  return {
+    name: opts.name,
+    definition: {
+      table: opts.table,
+      inputAttr: opts.inputAttr,
+      outputAttr: opts.outputAttr,
+      fallbackMappedKey: opts.fallbackMappedKey,
+    },
+  };
+}
+
+export function defineTableTransformFromRelation(opts: {
+  name: string;
+  relation: string;
+  keyColumn: string;
+  mappedColumn: string;
+  inputAttr: string;
+  outputAttr: string;
+  fallbackMappedKey?: any;
+}): { name: string; definition: TableTransformDefinition } {
+  return {
+    name: opts.name,
+    definition: {
+      relation: opts.relation,
+      keyColumn: opts.keyColumn,
+      mappedColumn: opts.mappedColumn,
+      inputAttr: opts.inputAttr,
+      outputAttr: opts.outputAttr,
+      fallbackMappedKey: opts.fallbackMappedKey,
+    },
+  };
+}
+
+export function tableTransformMetric(opts: {
+  name: string;
+  baseMetric: string;
+  transformId: string;
+  baseFact?: string;
+  description?: string;
+  inputAttr?: string;
+  outputAttr?: string;
+}): MetricDefinitionV2 {
+  const expr = Expr.tableTransform(
+    opts.baseMetric,
+    opts.transformId,
+    opts.inputAttr,
+    opts.outputAttr
+  );
+  return {
+    name: opts.name,
+    baseFact: opts.baseFact,
+    attributes: [opts.inputAttr, opts.outputAttr].filter(
+      (a): a is string => Boolean(a)
+    ),
+    deps: [opts.baseMetric],
+    description: opts.description,
+    exprAst: expr,
+    eval: compileMetricExpr(expr),
+  };
+}
+
 /* --------------------------------------------------------------------------
  * STATIC ANALYSIS + VALIDATION
  * -------------------------------------------------------------------------- */
@@ -1079,6 +1234,7 @@ function metricReferences(
     deps: new Set(metric.deps ?? []),
     literals: [],
     transforms: new Set<string>(),
+    tableTransforms: new Set<string>(),
   };
 }
 
@@ -1205,6 +1361,61 @@ export function validateMetric(
     }
   });
 
+  refs.tableTransforms.forEach((transformId) => {
+    const transform = model.tableTransforms?.[transformId];
+    if (!transform) {
+      errors.push({
+        metric: metricName,
+        message: `Transform "${transformId}" is not defined for metric "${metricName}"`,
+        suggestion: "Add the table transform configuration to the semantic model.",
+      });
+      return;
+    }
+
+    if (!model.attributes[transform.inputAttr]) {
+      errors.push({
+        metric: metricName,
+        message: `Transform input attribute "${transform.inputAttr}" is not in the semantic model`,
+        suggestion: "Define the input attribute so it can be used for mapping.",
+      });
+    }
+
+    if (!model.attributes[transform.outputAttr]) {
+      errors.push({
+        metric: metricName,
+        message: `Transform output attribute "${transform.outputAttr}" is not in the semantic model`,
+        suggestion: "Define the output attribute or correct the transform configuration.",
+      });
+    }
+
+    if (baseFact && !isAttributeReachable(baseFact, transform.outputAttr, model)) {
+      errors.push({
+        metric: metricName,
+        message: `Transform output attribute "${transform.outputAttr}" is not reachable from base fact "${baseFact}"`,
+        suggestion: "Ensure the transform output attribute belongs to the metric's base fact or add the necessary join.",
+      });
+    }
+
+    if (transform.table) {
+      const seen = new Map<any, Set<any>>();
+      transform.table.forEach((row) => {
+        const set = seen.get(row.key) ?? new Set<any>();
+        set.add(row.mappedKey);
+        seen.set(row.key, set);
+      });
+      for (const [key, mapped] of seen.entries()) {
+        if (mapped.size > 1) {
+          errors.push({
+            metric: metricName,
+            message: `Transform "${transformId}" maps input "${key}" to multiple targets`,
+            suggestion: "Confirm the mapping cardinality or mark the transform as intentionally many-to-many.",
+          });
+          break;
+        }
+      }
+    }
+  });
+
   return { metric: metricName, ok: errors.length === 0, errors };
 }
 
@@ -1270,6 +1481,57 @@ function applyRowsetTransform(
   });
 }
 
+function resolveTableTransformRows(
+  transform: TableTransformDefinition,
+  db: InMemoryDb
+): TableTransformMappingRow[] {
+  if (transform.table) return transform.table;
+
+  if (transform.relation) {
+    const rows = db.tables[transform.relation] ?? [];
+    const keyCol = transform.keyColumn ?? "key";
+    const mappedCol = transform.mappedColumn ?? "mappedKey";
+    return rows.map((r: Row) => ({ key: (r as any)[keyCol], mappedKey: (r as any)[mappedCol] }));
+  }
+
+  return [];
+}
+
+function applyTableTransform(
+  runtime: MetricRuntime,
+  transformId: string,
+  groupKey: Record<string, any>
+): RowSequence {
+  const transform = runtime.model.tableTransforms?.[transformId];
+  if (!transform) {
+    throw new Error(`Unknown table transform: ${transformId}`);
+  }
+
+  const anchorValue = groupKey[transform.inputAttr];
+  const mappingRows = resolveTableTransformRows(transform, runtime.db);
+  const mappedKeys = mappingRows
+    .filter((row) => row.key === anchorValue)
+    .map((row) => row.mappedKey);
+
+  if (!mappedKeys.length) {
+    if (transform.fallbackMappedKey !== undefined) {
+      mappedKeys.push(transform.fallbackMappedKey);
+    } else {
+      return rowsToEnumerable([]);
+    }
+  }
+
+  const allowed = new Set(mappedKeys);
+  return runtime.relation.where((row: Row) => {
+    if (!allowed.has((row as any)[transform.outputAttr])) return false;
+
+    return runtime.groupDimensions.every((dim) => {
+      if (dim === transform.inputAttr) return true;
+      return (row as any)[dim] === groupKey[dim];
+    });
+  });
+}
+
 /* --------------------------------------------------------------------------
  * METRIC EVALUATION
  * -------------------------------------------------------------------------- */
@@ -1303,6 +1565,8 @@ function evaluateMetric(
     runtime,
     applyRowsetTransform: (transformId, gk) =>
       applyRowsetTransform(runtime, transformId, gk),
+    applyTableTransform: (transformId, gk) =>
+      applyTableTransform(runtime, transformId, gk),
     bind(name: string) {
       const key = name.startsWith(":") ? name.slice(1) : name;
       if (!(key in runtime.bindings)) {
