@@ -336,6 +336,62 @@ export type MetricExpr =
       right: MetricExpr;
     };
 
+export const Expr = {
+  lit(value: number): MetricExpr {
+    return { kind: "Literal", value };
+  },
+
+  attr(name: string): MetricExpr {
+    return { kind: "AttrRef", name };
+  },
+
+  metric(name: string): MetricExpr {
+    return { kind: "MetricRef", name };
+  },
+
+  call(fn: string, ...args: MetricExpr[]): MetricExpr {
+    return { kind: "Call", fn, args };
+  },
+
+  add(left: MetricExpr, right: MetricExpr): MetricExpr {
+    return { kind: "BinaryOp", op: "+", left, right };
+  },
+
+  sub(left: MetricExpr, right: MetricExpr): MetricExpr {
+    return { kind: "BinaryOp", op: "-", left, right };
+  },
+
+  mul(left: MetricExpr, right: MetricExpr): MetricExpr {
+    return { kind: "BinaryOp", op: "*", left, right };
+  },
+
+  div(left: MetricExpr, right: MetricExpr): MetricExpr {
+    return { kind: "BinaryOp", op: "/", left, right };
+  },
+
+  sum(attrName: string): MetricExpr {
+    return this.call("sum", this.attr(attrName));
+  },
+  avg(attrName: string): MetricExpr {
+    return this.call("avg", this.attr(attrName));
+  },
+  min(attrName: string): MetricExpr {
+    return this.call("min", this.attr(attrName));
+  },
+  max(attrName: string): MetricExpr {
+    return this.call("max", this.attr(attrName));
+  },
+  count(attrName: string | "*"): MetricExpr {
+    return attrName === "*"
+      ? this.call("count", this.attr("*"))
+      : this.call("count", this.attr(attrName));
+  },
+
+  lastYear(metricName: string, anchorAttr: string): MetricExpr {
+    return this.call("last_year", this.metric(metricName), this.attr(anchorAttr));
+  },
+};
+
 export function collectAttrsAndDeps(expr: MetricExpr): {
   attrs: Set<string>;
   deps: Set<string>;
@@ -705,16 +761,51 @@ export function buildMetricFromExpr(opts: {
  */
 export function aggregateMetric(
   name: string,
+  baseFact: string,
   attr: string,
-  op: AggregationOperator = "sum",
-  baseFact?: string
-): MetricDefinition {
-  return {
+  op: AggregationOperator = "sum"
+): MetricDefinitionV2 {
+  let expr: MetricExpr;
+  switch (op) {
+    case "sum":
+      expr = Expr.sum(attr);
+      break;
+    case "avg":
+      expr = Expr.avg(attr);
+      break;
+    case "min":
+      expr = Expr.min(attr);
+      break;
+    case "max":
+      expr = Expr.max(attr);
+      break;
+    case "count":
+      expr = Expr.count(attr);
+      break;
+    default:
+      throw new Error(`Unsupported aggregation operator: ${op}`);
+  }
+
+  return buildMetricFromExpr({
     name,
-    attributes: [attr],
     baseFact,
-    eval: ({ rows }) => aggregate(rows, attr, op),
-  };
+    expr,
+  });
+}
+
+export function lastYearMetric(
+  name: string,
+  baseFact: string,
+  baseMetricName: string,
+  anchorAttr: string
+): MetricDefinitionV2 {
+  const expr = Expr.lastYear(baseMetricName, anchorAttr);
+
+  return buildMetricFromExpr({
+    name,
+    baseFact,
+    expr,
+  });
 }
 
 /* --------------------------------------------------------------------------
@@ -727,6 +818,7 @@ export function rowsetTransformMetric(opts: {
   transformId: string;
   description?: string;
 }): MetricDefinition {
+  // NOTE: Opaque metric – not backed by MetricExpr. Not visible to DSL tools.
   return {
     name: opts.name,
     deps: [opts.baseMetric],
