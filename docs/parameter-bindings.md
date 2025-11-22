@@ -1,5 +1,3 @@
-You’re right — the PRD was cut off near the end.
-Here is the complete, polished PRD, end-to-end, ready for your developer and ready to drop into your repo as BINDINGS-PRD.md.
 
 ⸻
 
