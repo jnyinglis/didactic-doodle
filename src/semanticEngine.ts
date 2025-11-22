@@ -92,7 +92,9 @@ export const f = {
   },
 };
 
-function normalizeFilterContext(context?: FilterContext): FilterNode | null {
+function normalizeFilterContext(
+  context?: FilterContext | null
+): FilterNode | null {
   if (!context) return null;
   if ("kind" in (context as any)) {
     return context as FilterNode;
@@ -143,6 +145,50 @@ function pruneFilterNode(node: FilterNode, allowed: Set<string>): FilterNode | n
   }
 }
 
+export function resolveBindingsInFilter(
+  filterNode: FilterNode | null,
+  bindings: Record<string, any>
+): FilterNode | null {
+  if (!filterNode) return null;
+
+  const resolveValue = (value: any): any => {
+    if (typeof value === "string" && value.startsWith(":")) {
+      const key = value.slice(1);
+      if (!(key in bindings)) {
+        throw new Error(`Missing binding '${value}'`);
+      }
+      return bindings[key];
+    }
+
+    if (Array.isArray(value)) {
+      return value.map((v) => resolveValue(v));
+    }
+
+    if (value && typeof value === "object") {
+      const clone: Record<string, any> = { ...value };
+      if ("value" in clone) clone.value = resolveValue(clone.value);
+      if ("from" in clone) clone.from = resolveValue(clone.from);
+      if ("to" in clone) clone.to = resolveValue(clone.to);
+      return clone;
+    }
+
+    return value;
+  };
+
+  if (filterNode.kind === "expression") {
+    return {
+      ...filterNode,
+      value: resolveValue(filterNode.value),
+      value2: resolveValue(filterNode.value2),
+    } as FilterExpression;
+  }
+
+  return {
+    kind: filterNode.kind,
+    filters: filterNode.filters.map((child) => resolveBindingsInFilter(child, bindings)!) as FilterNode[],
+  };
+}
+
 function matchesExpression(value: any, expr: FilterExpression): boolean {
   switch (expr.op) {
     case "eq":
@@ -188,7 +234,7 @@ function evaluateFilterNode(node: FilterNode, row: Row): boolean {
 
 function applyWhereFilter(
   relation: RowSequence,
-  where?: FilterContext,
+  where?: FilterContext | null,
   availableAttrs: string[] = []
 ): RowSequence {
   if (!where) return relation;
@@ -200,7 +246,7 @@ function applyWhereFilter(
   return relation.where((row: Row) => evaluateFilterNode(pruned, row));
 }
 
-function collectFilterFields(ctx?: FilterContext): Set<string> {
+function collectFilterFields(ctx?: FilterContext | null): Set<string> {
   const node = normalizeFilterContext(ctx);
   const fields = new Set<string>();
   if (!node) return fields;
@@ -296,8 +342,11 @@ export interface MetricRuntime {
   relation: RowSequence;        // joined + where-filtered relation
   whereFilter: FilterNode | null;
   groupDimensions: string[];    // logical dimension names for this query
+  bindings: Record<string, any>;
   baseFact?: string;            // present when metrics use a fact table
 }
+
+export type MetricRuntimeV2 = MetricRuntime;
 
 export interface MetricComputationContext {
   rows: RowSequence;                             // grouped rows for this output row
@@ -334,6 +383,7 @@ export interface MetricComputationHelpers {
     transformId: string,
     groupKey: Record<string, any>
   ): RowSequence;
+  bind(name: string): any;
 }
 
 // ---------------------------------------------------------------------------
@@ -453,6 +503,10 @@ export interface QuerySpec {
 }
 
 export type QuerySpecV2 = QuerySpec;
+
+export interface ExecutionOptions {
+  bindings?: Record<string, any>;
+}
 
 /* --------------------------------------------------------------------------
  * SEMANTIC HELPERS
@@ -978,6 +1032,13 @@ function evaluateMetric(
     runtime,
     applyRowsetTransform: (transformId, gk) =>
       applyRowsetTransform(runtime, transformId, gk),
+    bind(name: string) {
+      const key = name.startsWith(":") ? name.slice(1) : name;
+      if (!(key in runtime.bindings)) {
+        throw new Error(`Missing binding '${name}'`);
+      }
+      return runtime.bindings[key];
+    },
   };
 
   const value = metric.eval({ rows, groupKey, evalMetric, helpers });
@@ -1071,7 +1132,8 @@ function runSemanticQueryForBase(
   env: { db: InMemoryDb; model: SemanticModel },
   spec: QuerySpec,
   baseFact: string | null,
-  metricNames: string[]
+  metricNames: string[],
+  bindings: Record<string, any>
 ): SingleFactResult {
   const { db, model } = env;
   const dimensions = spec.dimensions;
@@ -1130,7 +1192,7 @@ function runSemanticQueryForBase(
   const whereNode = normalizeFilterContext(spec.where);
   const filtered = applyWhereFilter(
     baseRelation,
-    spec.where,
+    whereNode,
     Array.from(requiredAttrs)
   );
 
@@ -1183,6 +1245,7 @@ function runSemanticQueryForBase(
         baseFact: runtimeBaseFact,
         relation: baseRelation,
         whereFilter: whereNode,
+        bindings,
         groupDimensions: metricGrain,
       };
 
@@ -1223,12 +1286,17 @@ function pickDims(row: Row, dims: string[]): Row {
 
 export function runSemanticQuery(
   env: { db: InMemoryDb; model: SemanticModel },
-  spec: QuerySpec
+  spec: QuerySpec,
+  options?: ExecutionOptions
 ): Row[] {
   const { db, model } = env;
+  const bindings = options?.bindings ?? {};
   const dimensions = spec.dimensions;
 
-  const whereFields = collectFilterFields(spec.where);
+  const rawWhereNode = normalizeFilterContext(spec.where);
+  const whereNode = resolveBindingsInFilter(rawWhereNode, bindings);
+
+  const whereFields = collectFilterFields(whereNode);
 
   // Dimension-only query (no metrics)
   if (spec.metrics.length === 0) {
@@ -1263,7 +1331,7 @@ export function runSemanticQuery(
 
     const filtered = applyWhereFilter(
       relation,
-      spec.where,
+      whereNode,
       Array.from(requiredAttrs)
     );
 
@@ -1304,12 +1372,12 @@ export function runSemanticQuery(
     const childSpec: QuerySpec = {
       dimensions: spec.dimensions,
       metrics: metricNames,
-      where: spec.where,
+      where: whereNode ?? undefined,
       having: undefined,
     };
 
     perFactResults.push(
-      runSemanticQueryForBase(env, childSpec, baseFact, metricNames)
+      runSemanticQueryForBase(env, childSpec, baseFact, metricNames, bindings)
     );
   }
 
@@ -1345,7 +1413,7 @@ export function runSemanticQuery(
       );
       const filtered = applyWhereFilter(
         relation,
-        spec.where,
+        whereNode,
         Array.from(requiredAttrs)
       );
       filtered.forEach((row: Row) => {

@@ -15,6 +15,7 @@ import {
   evaluateMetricRuntime,
   rowsToEnumerable,
   runSemanticQuery,
+  f,
 } from "../src/semanticEngine";
 
 const db: InMemoryDb = {
@@ -72,6 +73,22 @@ const storeNameLength: MetricDefinition = {
       : undefined,
 };
 
+const salesForYear: MetricDefinition = {
+  name: "salesForYear",
+  baseFact: "fact_sales",
+  attributes: ["storeId", "week", "salesAmount"],
+  eval: ({ rows, helpers }) => {
+    const year = helpers.bind(":year");
+    const amounts = rows
+      .where((r) => Math.floor((r as any).week / 100) === year)
+      .select((r) => Number((r as any).salesAmount))
+      .toArray();
+
+    if (!amounts.length) return undefined;
+    return amounts.reduce((a, b) => a + b, 0);
+  },
+};
+
 const model: SemanticModel = {
   facts: {
     fact_sales: { table: "fact_sales" },
@@ -96,6 +113,7 @@ const model: SemanticModel = {
     totalOnHand,
     storeNameLength,
     budget: budgetMetric,
+    salesForYear,
   },
 };
 
@@ -174,18 +192,67 @@ describe("semanticEngine multi-fact", () => {
   });
 });
 
+describe("bindings", () => {
+  it("resolves bindings inside where filters", () => {
+    const spec: QuerySpec = {
+      dimensions: ["storeId", "week"],
+      metrics: ["totalSales"],
+      where: f.and(
+        f.in("storeId", [":storeOne", ":storeTwo"]),
+        f.between("week", ":weekStart" as any, ":weekEnd" as any)
+      ),
+    };
+
+    const rows = runSemanticQuery(
+      { db, model },
+      spec,
+      { bindings: { storeOne: 1, storeTwo: 2, weekStart: 202501, weekEnd: 202501 } }
+    );
+
+    expect(rows).to.have.deep.members([
+      { storeId: 1, week: 202501, totalSales: 100 },
+      { storeId: 2, week: 202501, totalSales: 200 },
+    ]);
+  });
+
+  it("makes bindings available to metrics and errors when missing", () => {
+    const spec: QuerySpec = {
+      dimensions: ["storeId", "week"],
+      metrics: ["salesForYear"],
+    };
+
+    const rows = runSemanticQuery(
+      { db, model },
+      spec,
+      { bindings: { year: 2025 } }
+    );
+
+    expect(rows).to.deep.include({
+      storeId: 1,
+      week: 202501,
+      salesForYear: 100,
+    });
+
+    expect(() => runSemanticQuery({ db, model }, spec)).to.throw(
+      "Missing binding ':year'"
+    );
+  });
+});
+
 describe("metric expression compiler", () => {
   const dummyRuntime: MetricRuntime = {
     model: { facts: {}, dimensions: {}, attributes: {}, joins: [], metrics: {} },
     db: { tables: {} },
     relation: rowsToEnumerable([]),
     whereFilter: null,
+    bindings: {},
     groupDimensions: [],
   };
 
   const helpers = {
     runtime: dummyRuntime,
     applyRowsetTransform: () => rowsToEnumerable([]),
+    bind: () => undefined,
   };
 
   it("evaluates aggregates from AST", () => {
@@ -273,6 +340,7 @@ describe("metric expression compiler", () => {
       baseFact: "fact_sales",
       relation: rowsToEnumerable(db.tables.fact_sales),
       whereFilter: null,
+      bindings: {},
       groupDimensions: ["tradyrwkcode"],
     };
 
@@ -312,7 +380,7 @@ describe("metric expression compiler", () => {
       groupKey: { tradyrwkcode: 202501 },
       evalMetric: (name) =>
         evaluateMetricRuntime(name, runtime, { tradyrwkcode: 202501 }, groupRows, undefined, metricCache),
-      helpers: { runtime, applyRowsetTransform: transformFn },
+      helpers: { runtime, applyRowsetTransform: transformFn, bind: () => undefined },
     };
 
     expect(evalFn(ctx)).to.equal(60);
