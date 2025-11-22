@@ -101,7 +101,7 @@ describe("semanticEngine multi-fact", () => {
 
     const rows = runSemanticQuery({ db, model }, spec);
 
-    expect(rows).to.have.lengthOf(2);
+    expect(rows).to.have.lengthOf(3);
     expect(rows).to.deep.include({
       storeId: 1,
       storeName: "Downtown",
@@ -116,9 +116,14 @@ describe("semanticEngine multi-fact", () => {
       totalOnHand: 10,
       storeNameLength: "Mall".length,
     });
+    const airportRow = rows.find((r) => r.storeId === 3);
+    expect(airportRow).to.include({ storeId: 3, storeName: "Airport" });
+    expect(airportRow?.totalSales).to.be.undefined;
+    expect(airportRow?.totalOnHand).to.equal(7);
+    expect(airportRow?.storeNameLength).to.equal("Airport".length);
   });
 
-  it("keeps the primary fact as the frame when other facts have extra rows", () => {
+  it("builds the frame from the union of dimension keys across facts", () => {
     const spec: QuerySpec = {
       dimensions: ["storeId"],
       metrics: ["totalSales", "totalOnHand"],
@@ -127,8 +132,9 @@ describe("semanticEngine multi-fact", () => {
     const rows = runSemanticQuery({ db, model }, spec);
     const storeIds = rows.map((r) => r.storeId);
 
-    expect(storeIds).to.have.members([1, 2]);
-    expect(storeIds).to.not.include(3);
+    expect(storeIds).to.have.members([1, 2, 3]);
+    expect(rows.find((r) => r.storeId === 3)?.totalOnHand).to.equal(7);
+    expect(rows.find((r) => r.storeId === 3)?.totalSales).to.be.undefined;
   });
 });
 

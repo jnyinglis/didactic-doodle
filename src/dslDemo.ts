@@ -98,10 +98,12 @@ query weekly_sales {
         { returnId: "r1", storeId: 1, weekCode: 202401, refund: 20 },
         { returnId: "r2", storeId: 2, weekCode: 202401, refund: 15 },
         { returnId: "r3", storeId: 1, weekCode: 202301, refund: 12 },
+        { returnId: "r4", storeId: 3, weekCode: 202401, refund: 5 },
       ],
       dim_store: [
         { id: 1, storeName: "Downtown", region: "North" },
         { id: 2, storeName: "Mall", region: "South" },
+        { id: 3, storeName: "Outlet", region: "East" },
       ],
       dim_week: [
         { code: 202401, label: "2024-W01" },
@@ -134,10 +136,18 @@ query weekly_sales {
   const spec: QuerySpec = parseAll(queryDecl, queryText).spec;
   const rows = runSemanticQuery({ db, model }, spec);
 
+  const unionSpec: QuerySpec = {
+    dimensions: ["storeName", "region"],
+    metrics: ["total_sales", "total_refunds"],
+  };
+  const unionRows = runSemanticQuery({ db, model }, unionSpec);
+
   console.log("DSL metrics parsed:");
   metricDefs.forEach((m) => console.log(`- ${m.name} (base fact: ${m.baseFact ?? "<derived>"})`));
   console.log("\nQuery spec:", JSON.stringify(spec, null, 2));
   console.log("\nDSL demo output:", rows);
+  console.log("\nUnion-of-dimensions query spec:", JSON.stringify(unionSpec, null, 2));
+  console.log("Union-of-dimensions DSL output:", unionRows);
 }
 
 if (require.main === module) {
