@@ -1,129 +1,81 @@
-# Relational Semantic Engine POC
+# Semantic Engine V2
 
-This repository hosts a TypeScript proof-of-concept for a **LINQ-only, relational-algebra semantic engine**. The runtime embraces three pillars:
+This repository contains a **grain-agnostic semantic metrics engine** built entirely in TypeScript. Metrics see only the rows and group key for the current query grain, while the runtime selects the base fact table from metric declarations or falls back to a single related dimension when no facts are needed. LINQ primitives from [`src/linq.js`](src/linq.js) power projection, filtering, grouping, and joining so everything stays in-memory and deterministic.
 
-1. **Frame-first execution** – Queries build a cross-join frame from attribute domains and treat every metric as a LEFT JOIN off that frame.
-2. **Measure-only metrics** – Metrics operate exclusively on measure value streams so aggregations and expressions are deterministic and reusable.
-3. **LINQ everywhere** – Filtering, projection, grouping, joining, and aggregation all lean on the bundled [`linq.js`](src/linq.js) operators via `rowsToEnumerable`.
+## Core ideas
 
-Key capabilities include:
-
-- Unified table metadata covering grains, relationships, and column descriptions.
-- Filter contexts expressed through a concise DSL (`f.eq`, `f.and`, range helpers) that normalize down to LINQ predicates.
-- **Relational metrics** that return `Enumerable<Row>` instances for the `runRelationalQuery` flow, allowing metrics to compose purely through LINQ operations.
-- Relational aggregate + expression metric builders that consume `Enumerable<number>` sequences, ensuring consistent behavior regardless of grain.
-
-Everything is implemented inside [`src/semanticEngine.ts`](src/semanticEngine.ts) with a standalone demo harness in [`src/semanticEngineDemo.ts`](src/semanticEngineDemo.ts) that wires up sample data and relational metrics.
+- **Metric functions, not grain-bound measures** – `MetricDefinitionV2` exposes an `eval` function that receives grouped rows and the current group key; grains are provided by the query, not by the metric definition. 【F:src/semanticEngineV2.ts†L288-L314】
+- **Explicit base fact selection with graceful dimension fallback** – When metrics declare `baseFact`, the engine builds a fact-backed frame and stitches in additional fact groups as needed; when no metrics or `baseFact` values are present, it runs against a single dimension relation instead of requiring a fact table. 【F:src/semanticEngineV2.ts†L637-L799】【F:src/semanticEngineV2.ts†L801-L939】
+- **Rowset transforms for time intelligence** – Metrics can invoke `helpers.applyRowsetTransform` to swap the rowset they aggregate over (e.g., last-year alignment) while still reporting at the current grain. 【F:src/semanticEngineV2.ts†L308-L314】【F:src/semanticEngineV2.ts†L525-L591】
+- **Attribute-first filtering** – The `f` helpers normalize objects or filter nodes into expressions that are pruned to available attributes before evaluation, keeping `where` clauses composable across facts and dimensions. 【F:src/semanticEngineV2.ts†L32-L93】【F:src/semanticEngineV2.ts†L95-L216】
 
 ## Repository layout
 
 | Path | Description |
 | --- | --- |
-| [`src/semanticEngine.ts`](src/semanticEngine.ts) | Core engine, builders (`attr`, `measure`, `relAggregateMetric`, etc.), relational query execution, and helper utilities. |
-| [`src/semanticEngineDemo.ts`](src/semanticEngineDemo.ts) | Small runnable environment that seeds a store/product dataset and showcases relational query execution. |
-| [`src/linq.js`](src/linq.js) / [`src/linq.d.ts`](src/linq.d.ts) | Bundled LINQ runtime plus the TypeScript declaration file used by the engine and tests. |
-| [`src/operators.md`](src/operators.md) | Operator reference for anyone authoring custom LINQ-powered metrics or transforms. |
-| [`test/semanticEngine.test.ts`](test/semanticEngine.test.ts) | Mocha + Chai coverage for filter normalization, measure projection, relational metrics, and the LINQ-only relational executor. |
-| [`SPEC.md`](SPEC.md) | Design notes motivating the LINQ-first refactor and documenting the architectural goals. |
+| [`src/semanticEngineV2.ts`](src/semanticEngineV2.ts) | Core V2 engine with filter helpers, metric definitions, rowset transforms, and `runSemanticQuery`. |
+| [`src/semanticEngineDemoV2.ts`](src/semanticEngineDemoV2.ts) | Minimal demo wiring a store dataset, two fact tables, and aggregate metrics. |
+| [`src/linq.js`](src/linq.js) / [`src/linq.d.ts`](src/linq.d.ts) | Bundled LINQ runtime plus TypeScript declarations used by the engine and tests. |
+| [`src/operators.md`](src/operators.md) | Operator reference for custom LINQ-powered transforms. |
+| [`test/semanticEngineV2.test.ts`](test/semanticEngineV2.test.ts) | Mocha + Chai coverage for base fact selection, filters, and rowset transforms. |
+| [`SPEC.md`](SPEC.md) | Design notes motivating the grain-agnostic flow. |
 
 ## Getting started
 
-1. **Install dependencies** (TypeScript toolchain + Mocha/Chai):
+1. **Install dependencies**:
    ```bash
    npm install
    ```
-2. **Run the automated tests** to exercise the relational engine end-to-end:
+2. **Run the automated tests** to exercise the V2 engine end-to-end:
    ```bash
    npm test
    ```
-   The suite validates `applyContextToTable`, `projectMeasureValues`, relational metric builders, and the `runRelationalQuery` pipeline.
-3. **Try the CLI demo** (optional) to see the relational execution path in action:
+3. **Try the demo** to see a multi-fact query at work:
    ```bash
-   npx ts-node src/semanticEngineDemo.ts
+   npx ts-node src/semanticEngineDemoV2.ts
    ```
-   The script prints two relational frames (store × product × year and year × month) so you can observe how metrics join back onto the frame.
 
-## Using the relational engine
+## Using the V2 engine
 
-Relational queries are described through `QuerySpec` objects that list the requested attributes, metrics, and filters. Each relational metric returns a relation keyed by its grain and the engine LEFT JOINs them onto the frame:
-
-```ts
-import {
-  MetricEvaluationEnvironment,
-  relAggregateMetric,
-  relExpressionMetric,
-  runRelationalQuery,
-  attr,
-  measure,
-  f,
-} from "./src/semanticEngine";
-
-// Build a SemanticModel with attributes/measures omitted for brevity.
-const env: MetricEvaluationEnvironment = { model, db };
-
-model.relationalMetrics = {
-  totalSalesAmount: relAggregateMetric({ name: "totalSalesAmount", measure: "amount", agg: "sum" }),
-  totalBudget: relAggregateMetric({ name: "totalBudget", measure: "budgetAmount", agg: "sum", grain: ["year"] }),
-  salesDelta: relExpressionMetric({
-    name: "salesDelta",
-    measure: "amount",
-    grain: ["storeId", "productId", "year"],
-    expr: (values) => values.sum() * -1,
-  }),
-};
-
-const spec = {
-  attributes: ["storeId", "productId", "year"],
-  metrics: ["totalSalesAmount", "totalBudget", "salesDelta"],
-  filters: f.eq("year", 2025),
-};
-
-const rows = runRelationalQuery(env, spec);
-console.table(rows);
-```
-
-This produces the classic relational flow:
-
-```
-Frame (store × product × year)
-  LEFT JOIN totalSalesAmount
-  LEFT JOIN totalBudget
-  LEFT JOIN salesDelta
-```
-
-## Extending the POC
-
-1. **Model tables and attributes** via `TableDefinitionRegistry` and `AttributeRegistry`. Attribute definitions map semantic names to the columns that appear in your frame tables.
-2. **Declare measures** with `measure.fact(...)` to describe which table + column supply numeric values and what grain they naturally live at.
-3. **Author relational metrics** using `relAggregateMetric` or `relExpressionMetric`. You can also keep scalar metrics (simple, expression, derived, context transforms) for parity with the legacy executor.
-4. **Compose query specs** by hand; the relational executor accepts plain objects describing the frame attributes, metrics, and filters.
-5. **Experiment**: because every operation is LINQ-backed, it is straightforward to add more complex joins, windows, or label enrichment steps directly inside metrics or helper functions.
-
-Everything runs fully in-memory, making this repository a safe playground for prototyping relational-semantic ideas before porting them to a SQL-backed engine.
-
-## Grain-agnostic DSL (PLAN.md alignment)
-
-`PLAN.md` describes a grain-agnostic metric contract where metrics are pure functions over the fact rows for the current group. The new helpers in `semanticEngine.ts` (`runSemanticQuery`, `aggregateMetric`, `rowsetTransformMetric`) implement that flow:
+Relational queries are described with `QuerySpecV2` objects that list the output dimensions, metrics, and filters. Metrics are plain functions declared via helpers such as `aggregateMetric` and are free to call other metrics through `evalMetric` or swap rowsets through `applyRowsetTransform`.
 
 ```ts
 import {
   aggregateMetric,
-  rowsetTransformMetric,
   runSemanticQuery,
-  f,
-} from "./src/semanticEngine";
+  QuerySpecV2,
+  SemanticModelV2,
+} from "./src/semanticEngineV2";
 
-const model = { /* SemanticModelV2 with attributes, joins, metrics */ };
-const env = { model, db };
-
-const spec = {
-  dimensions: ["storeId", "year"],
-  metrics: ["totalSales", "lastYearSales"],
-  where: f.eq("year", 2025),
+const model: SemanticModelV2 = {
+  facts: {
+    fact_orders: { name: "fact_orders" },
+    fact_returns: { name: "fact_returns" },
+  },
+  dimensions: { dim_store: { name: "dim_store" } },
+  attributes: {
+    storeId: { name: "storeId", relation: "fact_orders", column: "storeId" },
+    storeName: { name: "storeName", relation: "dim_store", column: "storeName" },
+    amount: { name: "amount", relation: "fact_orders", column: "amount" },
+    refund: { name: "refund", relation: "fact_returns", column: "refund" },
+  },
+  joins: [
+    { fact: "fact_orders", dimension: "dim_store", factKey: "storeId", dimensionKey: "id" },
+    { fact: "fact_returns", dimension: "dim_store", factKey: "storeId", dimensionKey: "id" },
+  ],
+  metricsV2: {
+    totalSales: aggregateMetric("totalSales", "amount", "sum", "fact_orders"),
+    totalRefunds: aggregateMetric("totalRefunds", "refund", "sum", "fact_returns"),
+  },
 };
 
-const rows = runSemanticQuery(env, model, spec);
-// → rows grouped by (storeId, year) with metrics evaluated per group
+const spec: QuerySpecV2 = {
+  dimensions: ["storeId", "storeName"],
+  metrics: ["totalSales", "totalRefunds"],
+};
+
+const rows = runSemanticQuery({ db, model }, spec);
+console.log(rows);
 ```
 
-Metrics never hardcode their own grain; they recompute from the fact rows supplied by the query grain, and rowset transforms (e.g., last-year shifts) run as higher-order wrappers around those base metrics.
+The engine builds a fact-backed frame for the primary fact, runs metric evaluators within each grouped rowset, and merges results across additional facts or dimension-scoped metrics before applying optional `having` filters. 【F:src/semanticEngineV2.ts†L801-L976】
