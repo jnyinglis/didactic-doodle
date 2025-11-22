@@ -939,22 +939,64 @@ export function evaluateMetricRuntime(
 interface SingleFactResult {
   rows: Row[];
   fact: string | null;
+  metricRows: Record<string, Row[]>;
+  supportsAllDimensions: boolean;
 }
 
 function collectRequiredAttributes(
   dimensions: string[],
   whereFields: Set<string>,
   metricNames: string[],
-  model: SemanticModel
+  model: SemanticModel,
+  supportsAllDimensions: boolean
 ): Set<string> {
-  const requiredAttrs = new Set<string>([...dimensions]);
+  const requiredAttrs = new Set<string>();
+
+  if (supportsAllDimensions) {
+    dimensions.forEach((d) => requiredAttrs.add(d));
+  }
+
   whereFields.forEach((f) => requiredAttrs.add(f));
 
   metricNames.forEach((m) => {
     model.metrics[m]?.attributes?.forEach((a) => requiredAttrs.add(a));
   });
 
+  if (requiredAttrs.size === 0) {
+    dimensions.forEach((d) => requiredAttrs.add(d));
+  }
+
   return requiredAttrs;
+}
+
+function factSupportsAllDimensions(
+  fact: string | null,
+  dimensions: string[],
+  model: SemanticModel
+): boolean {
+  if (!fact) return false;
+  return dimensions.every((dim) => {
+    const attr = model.attributes[dim];
+    if (!attr) return false;
+    if (attr.relation === fact) return true;
+    const joinKey = `${fact}|${attr.relation}`;
+    return model.joins.some((edge) => `${edge.fact}|${edge.dimension}` === joinKey);
+  });
+}
+
+function metricGrainForQuery(
+  metric: MetricDefinition | undefined,
+  dimensions: string[],
+  supportsAllDimensions: boolean
+): string[] {
+  const attrs = metric?.attributes;
+  if (attrs) {
+    const intersection = attrs.filter((a) => dimensions.includes(a));
+    if (intersection.length > 0) return intersection;
+    if (attrs.length === 0) return [];
+  }
+
+  return supportsAllDimensions ? dimensions : [];
 }
 
 function runSemanticQueryForBase(
@@ -966,11 +1008,17 @@ function runSemanticQueryForBase(
   const { db, model } = env;
   const dimensions = spec.dimensions;
   const whereFields = collectFilterFields(spec.where);
+  const supportsAllDimensions = factSupportsAllDimensions(
+    baseFact,
+    dimensions,
+    model
+  );
   const requiredAttrs = collectRequiredAttributes(
     dimensions,
     whereFields,
     metricNames,
-    model
+    model,
+    supportsAllDimensions
   );
 
   let baseRelation: RowSequence;
@@ -1023,7 +1071,7 @@ function runSemanticQueryForBase(
     (row: Row) => row
   );
 
-  const rows: Row[] = [];
+  const frameRows: Row[] = [];
   grouped.forEach((group) => {
     const sample = group.first();
     const groupKey: Record<string, any> = {};
@@ -1031,33 +1079,62 @@ function runSemanticQueryForBase(
       dimensions.forEach((d) => (groupKey[d] = (sample as any)[d]));
     }
 
-    const runtime: MetricRuntime = {
-      model,
-      db,
-      baseFact: runtimeBaseFact,
-      relation: baseRelation,
-      whereFilter: whereNode,
-      groupDimensions: dimensions,
-    };
-
-    const metricValues: Record<string, number | undefined> = {};
-    const metricCache = new Map<string, number | undefined>();
-
-    metricNames.forEach((m) => {
-      metricValues[m] = evaluateMetric(
-        m,
-        runtime,
-        groupKey,
-        group,
-        undefined,
-        metricCache
-      );
-    });
-
-    rows.push({ ...groupKey, ...metricValues });
+    if (supportsAllDimensions) {
+      frameRows.push(groupKey);
+    }
   });
 
-  return { rows, fact: baseFact };
+  const metricRows: Record<string, Row[]> = {};
+
+  for (const metricName of metricNames) {
+    const metric = model.metrics[metricName];
+    const metricGrain = metricGrainForQuery(
+      metric,
+      dimensions,
+      supportsAllDimensions
+    );
+
+    const metricGrouped = filtered.groupBy(
+      (row: Row) => keyFromRow(row, metricGrain),
+      (row: Row) => row
+    );
+
+    const rows: Row[] = [];
+    const metricCache = new Map<string, number | undefined>();
+
+    metricGrouped.forEach((group) => {
+      const sample = group.first();
+      const groupKey: Record<string, any> = {};
+      if (sample) {
+        metricGrain.forEach((d) => (groupKey[d] = (sample as any)[d]));
+      }
+
+      const runtime: MetricRuntime = {
+        model,
+        db,
+        baseFact: runtimeBaseFact,
+        relation: baseRelation,
+        whereFilter: whereNode,
+        groupDimensions: metricGrain,
+      };
+
+      rows.push({
+        ...groupKey,
+        [metricName]: evaluateMetric(
+          metricName,
+          runtime,
+          groupKey,
+          group,
+          undefined,
+          metricCache
+        ),
+      });
+    });
+
+    metricRows[metricName] = rows;
+  }
+
+  return { rows: frameRows, fact: baseFact, metricRows, supportsAllDimensions };
 }
 
 function dimKeyFromRow(row: Row, dims: string[]): string {
@@ -1170,7 +1247,8 @@ export function runSemanticQuery(
 
   const frame = new Map<string, Row>();
 
-  for (const { rows } of perFactResults) {
+  for (const { rows, supportsAllDimensions } of perFactResults) {
+    if (!supportsAllDimensions) continue;
     for (const row of rows) {
       const key = dimKeyFromRow(row, dimensions);
       const existing = frame.get(key) ?? {};
@@ -1178,15 +1256,58 @@ export function runSemanticQuery(
     }
   }
 
-  for (const { rows } of perFactResults) {
-    for (const row of rows) {
-      const key = dimKeyFromRow(row, dimensions);
-      const target = frame.get(key)!;
-      for (const [k, v] of Object.entries(row)) {
-        if (!dimensions.includes(k)) {
-          target[k] = v;
+  if (frame.size === 0) {
+    const relationsUsed = new Set<string>();
+    const requiredAttrs = new Set<string>([...dimensions]);
+    whereFields.forEach((f) => requiredAttrs.add(f));
+
+    for (const attr of requiredAttrs) {
+      const def = model.attributes[attr];
+      if (!def) continue;
+      relationsUsed.add(def.relation);
+    }
+
+    if (relationsUsed.size === 1) {
+      const singleRelation = Array.from(relationsUsed)[0];
+      const relation = buildDimensionBaseRelation(
+        model,
+        db,
+        singleRelation,
+        requiredAttrs
+      );
+      const filtered = applyWhereFilter(
+        relation,
+        spec.where,
+        Array.from(requiredAttrs)
+      );
+      filtered.forEach((row: Row) => {
+        const key = dimKeyFromRow(row, dimensions);
+        frame.set(key, pickDims(row, dimensions));
+      });
+    }
+  }
+
+  for (const { metricRows, supportsAllDimensions } of perFactResults) {
+    for (const [metricName, rows] of Object.entries(metricRows)) {
+      const metric = model.metrics[metricName];
+      const metricGrain = metricGrainForQuery(
+        metric,
+        dimensions,
+        supportsAllDimensions
+      );
+
+      const factMetricMap = new Map<string, Row>();
+      rows.forEach((row) => {
+        factMetricMap.set(keyFromRow(row, metricGrain), row);
+      });
+
+      frame.forEach((frameRow) => {
+        const keyMatch = keyFromRow(frameRow, metricGrain);
+        const metricRow = factMetricMap.get(keyMatch);
+        if (metricRow) {
+          Object.assign(frameRow, metricRow);
         }
-      }
+      });
     }
   }
 

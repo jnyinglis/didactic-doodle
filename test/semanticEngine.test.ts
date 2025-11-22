@@ -20,19 +20,27 @@ import {
 const db: InMemoryDb = {
   tables: {
     fact_sales: [
-      { storeId: 1, month: 1, salesAmount: 100 },
-      { storeId: 1, month: 2, salesAmount: 50 },
-      { storeId: 2, month: 1, salesAmount: 200 },
+      { storeId: 1, month: 1, salesAmount: 100, week: 202501 },
+      { storeId: 1, month: 2, salesAmount: 50, week: 202502 },
+      { storeId: 2, month: 1, salesAmount: 200, week: 202501 },
     ],
     fact_inventory: [
       { storeId: 1, onHand: 5 },
       { storeId: 2, onHand: 10 },
       { storeId: 3, onHand: 7 },
     ],
+    fact_budget: [
+      { week: 202501 },
+      { week: 202502 },
+    ],
     dim_store: [
       { id: 1, storeName: "Downtown" },
       { id: 2, storeName: "Mall" },
       { id: 3, storeName: "Airport" },
+    ],
+    dim_week: [
+      { id: 202501 },
+      { id: 202502 },
     ],
   },
 };
@@ -47,10 +55,17 @@ const attributes: Record<string, LogicalAttribute> = {
   },
   onHand: { name: "onHand", relation: "fact_inventory", column: "onHand" },
   storeName: { name: "storeName", relation: "dim_store", column: "storeName" },
+  week: { name: "week", relation: "dim_week", column: "id" },
 };
 
 const totalSales = aggregateMetric("totalSales", "fact_sales", "salesAmount", "sum");
 const totalOnHand = aggregateMetric("totalOnHand", "fact_inventory", "onHand", "sum");
+const budgetMetric: MetricDefinition = {
+  name: "budget",
+  baseFact: "fact_budget",
+  attributes: ["week"],
+  eval: ({ groupKey }) => ({ 202501: 100, 202502: 150 } as any)[groupKey.week],
+};
 
 const storeNameLength: MetricDefinition = {
   name: "storeNameLength",
@@ -62,8 +77,12 @@ const storeNameLength: MetricDefinition = {
 };
 
 const model: SemanticModel = {
-  facts: { fact_sales: { name: "fact_sales" }, fact_inventory: { name: "fact_inventory" } },
-  dimensions: { dim_store: { name: "dim_store" } },
+  facts: {
+    fact_sales: { name: "fact_sales" },
+    fact_inventory: { name: "fact_inventory" },
+    fact_budget: { name: "fact_budget" },
+  },
+  dimensions: { dim_store: { name: "dim_store" }, dim_week: { name: "dim_week" } },
   attributes,
   joins: [
     { fact: "fact_sales", dimension: "dim_store", factKey: "storeId", dimensionKey: "id" },
@@ -73,11 +92,14 @@ const model: SemanticModel = {
       factKey: "storeId",
       dimensionKey: "id",
     },
+    { fact: "fact_sales", dimension: "dim_week", factKey: "week", dimensionKey: "id" },
+    { fact: "fact_budget", dimension: "dim_week", factKey: "week", dimensionKey: "id" },
   ],
   metrics: {
     totalSales,
     totalOnHand,
     storeNameLength,
+    budget: budgetMetric,
   },
 };
 
@@ -135,6 +157,24 @@ describe("semanticEngine multi-fact", () => {
     expect(storeIds).to.have.members([1, 2, 3]);
     expect(rows.find((r) => r.storeId === 3)?.totalOnHand).to.equal(7);
     expect(rows.find((r) => r.storeId === 3)?.totalSales).to.be.undefined;
+  });
+
+  it("joins coarse-grain metrics using their native grain and broadcasts", () => {
+    const spec: QuerySpec = {
+      dimensions: ["storeId", "week"],
+      metrics: ["totalSales", "budget"],
+    };
+
+    const rows = runSemanticQuery({ db, model }, spec);
+
+    const store1Week1 = rows.find((r) => r.storeId === 1 && r.week === 202501);
+    const store2Week1 = rows.find((r) => r.storeId === 2 && r.week === 202501);
+
+    expect(store1Week1).to.include({ totalSales: 100, budget: 100 });
+    expect(store2Week1).to.include({ totalSales: 200, budget: 100 });
+
+    const store1Week2 = rows.find((r) => r.storeId === 1 && r.week === 202502);
+    expect(store1Week2).to.include({ totalSales: 50, budget: 150 });
   });
 });
 
