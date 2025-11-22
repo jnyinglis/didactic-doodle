@@ -19,6 +19,9 @@ import {
   validateMetric,
   validateAll,
   lastYearMetric,
+  tableTransformMetric,
+  defineTableTransform,
+  defineTableTransformFromRelation,
 } from "../src/semanticEngine";
 
 const db: InMemoryDb = {
@@ -145,6 +148,177 @@ describe("metric builders", () => {
     expect(metric.attributes).to.deep.equal(["salesAmount"]);
     expect(metric.deps).to.deep.equal([]);
     expect(metric.baseFact).to.equal("fact_sales");
+  });
+});
+
+describe("table transforms", () => {
+  it("applies inline mapping tables for weekly shifts", () => {
+    const db: InMemoryDb = {
+      tables: {
+        fact_sales: [
+          { week: 202501, salesAmount: 100 },
+          { week: 202502, salesAmount: 75 },
+        ],
+        prev_week_map: [{ key: 202502, mappedKey: 202501 }],
+      },
+    };
+
+    const sales = aggregateMetric("sales", "fact_sales", "salesAmount", "sum");
+    const { definition: transformDef } = defineTableTransform({
+      name: "prev_week",
+      table: db.tables.prev_week_map as any,
+      inputAttr: "week",
+      outputAttr: "week",
+    });
+
+    const model: SemanticModel = {
+      facts: { fact_sales: { table: "fact_sales" } },
+      dimensions: {},
+      attributes: { week: { table: "fact_sales" }, salesAmount: { table: "fact_sales" } },
+      joins: [],
+      metrics: {
+        sales,
+        prevWeekSales: tableTransformMetric({
+          name: "prevWeekSales",
+          baseMetric: "sales",
+          transformId: "prev_week",
+          baseFact: "fact_sales",
+          inputAttr: "week",
+          outputAttr: "week",
+        }),
+      },
+      tableTransforms: { prev_week: transformDef },
+    };
+
+    const rows = runSemanticQuery(
+      { db, model },
+      { dimensions: ["week"], metrics: ["sales", "prevWeekSales"] }
+    );
+
+    const week1 = rows.find((r) => r.week === 202501);
+    const week2 = rows.find((r) => r.week === 202502);
+
+    expect(week1?.sales).to.equal(100);
+    expect(week1?.prevWeekSales).to.be.undefined;
+    expect(week2?.sales).to.equal(75);
+    expect(week2?.prevWeekSales).to.equal(100);
+  });
+
+  it("supports many-to-one bucket mappings and missing entries", () => {
+    const db: InMemoryDb = {
+      tables: {
+        fact_sales: [
+          { storeId: 1, storeBucket: "urban", salesAmount: 100 },
+          { storeId: 2, storeBucket: "urban", salesAmount: 50 },
+          { storeId: 3, storeBucket: "airport", salesAmount: 25 },
+          { storeId: 4, storeBucket: "suburban", salesAmount: 10 },
+        ],
+        bucket_map: [
+          { store_id: 1, bucket: "urban" },
+          { store_id: 2, bucket: "urban" },
+          { store_id: 3, bucket: "airport" },
+        ],
+      },
+    };
+
+    const totalSales = aggregateMetric("totalSales", "fact_sales", "salesAmount", "sum");
+    const { definition: bucketTransform } = defineTableTransformFromRelation({
+      name: "store_bucket",
+      relation: "bucket_map",
+      keyColumn: "store_id",
+      mappedColumn: "bucket",
+      inputAttr: "storeId",
+      outputAttr: "storeBucket",
+    });
+
+    const model: SemanticModel = {
+      facts: { fact_sales: { table: "fact_sales" } },
+      dimensions: {},
+      attributes: {
+        storeId: { table: "fact_sales" },
+        storeBucket: { table: "fact_sales" },
+        salesAmount: { table: "fact_sales" },
+      },
+      joins: [],
+      metrics: {
+        totalSales,
+        bucketSales: tableTransformMetric({
+          name: "bucketSales",
+          baseMetric: "totalSales",
+          transformId: "store_bucket",
+          baseFact: "fact_sales",
+          inputAttr: "storeId",
+          outputAttr: "storeBucket",
+        }),
+      },
+      tableTransforms: { store_bucket: bucketTransform },
+    };
+
+    const rows = runSemanticQuery(
+      { db, model },
+      { dimensions: ["storeId"], metrics: ["totalSales", "bucketSales"] }
+    );
+
+    const urbanStores = rows.filter((r) => r.storeId === 1 || r.storeId === 2);
+    urbanStores.forEach((row) => {
+      expect(row.bucketSales).to.equal(150);
+    });
+
+    const airportStore = rows.find((r) => r.storeId === 3);
+    expect(airportStore?.bucketSales).to.equal(25);
+
+    const missingMapping = rows.find((r) => r.storeId === 4);
+    expect(missingMapping?.bucketSales).to.be.undefined;
+  });
+
+  it("fans out when a key maps to multiple targets", () => {
+    const db: InMemoryDb = {
+      tables: {
+        fact_sales: [
+          { week: 202401, salesAmount: 20 },
+          { week: 202402, salesAmount: 30 },
+          { week: 202501, salesAmount: 15 },
+        ],
+        multi_map: [
+          { key: 202501, mappedKey: 202401 },
+          { key: 202501, mappedKey: 202402 },
+        ],
+      },
+    };
+
+    const sales = aggregateMetric("sales", "fact_sales", "salesAmount", "sum");
+    const model: SemanticModel = {
+      facts: { fact_sales: { table: "fact_sales" } },
+      dimensions: {},
+      attributes: { week: { table: "fact_sales" }, salesAmount: { table: "fact_sales" } },
+      joins: [],
+      metrics: {
+        sales,
+        fanOutSales: tableTransformMetric({
+          name: "fanOutSales",
+          baseMetric: "sales",
+          transformId: "multi",
+          baseFact: "fact_sales",
+          inputAttr: "week",
+          outputAttr: "week",
+        }),
+      },
+      tableTransforms: {
+        multi: {
+          table: db.tables.multi_map as any,
+          inputAttr: "week",
+          outputAttr: "week",
+        },
+      },
+    };
+
+    const rows = runSemanticQuery(
+      { db, model },
+      { dimensions: ["week"], metrics: ["sales", "fanOutSales"] }
+    );
+
+    const fanOut = rows.find((r) => r.week === 202501);
+    expect(fanOut?.fanOutSales).to.equal(50);
   });
 });
 
@@ -357,6 +531,7 @@ describe("metric expression compiler", () => {
   const helpers = {
     runtime: dummyRuntime,
     applyRowsetTransform: () => rowsToEnumerable([]),
+    applyTableTransform: () => rowsToEnumerable([]),
     bind: () => undefined,
   };
 
@@ -485,7 +660,12 @@ describe("metric expression compiler", () => {
       groupKey: { tradyrwkcode: 202501 },
       evalMetric: (name) =>
         evaluateMetricRuntime(name, runtime, { tradyrwkcode: 202501 }, groupRows, undefined, metricCache),
-      helpers: { runtime, applyRowsetTransform: transformFn, bind: () => undefined },
+      helpers: {
+        runtime,
+        applyRowsetTransform: transformFn,
+        applyTableTransform: () => rowsToEnumerable([]),
+        bind: () => undefined,
+      },
     };
 
     expect(evalFn(ctx)).to.equal(60);
