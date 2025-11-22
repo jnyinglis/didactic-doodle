@@ -307,7 +307,7 @@ export interface MetricDefinition {
 }
 
 export interface MetricDefinitionV2 extends MetricDefinition {
-  exprAst?: any;
+  exprAst?: MetricExpr;
 }
 
 export type MetricRegistry = Record<string, MetricDefinition>;
@@ -318,6 +318,53 @@ export interface MetricComputationHelpers {
     transformId: string,
     groupKey: Record<string, any>
   ): RowSequence;
+}
+
+// ---------------------------------------------------------------------------
+// METRIC EXPRESSION AST
+// ---------------------------------------------------------------------------
+
+export type MetricExpr =
+  | { kind: "Literal"; value: number }
+  | { kind: "AttrRef"; name: string }
+  | { kind: "MetricRef"; name: string }
+  | { kind: "Call"; fn: string; args: MetricExpr[] }
+  | {
+      kind: "BinaryOp";
+      op: "+" | "-" | "*" | "/";
+      left: MetricExpr;
+      right: MetricExpr;
+    };
+
+export function collectAttrsAndDeps(expr: MetricExpr): {
+  attrs: Set<string>;
+  deps: Set<string>;
+} {
+  const attrs = new Set<string>();
+  const deps = new Set<string>();
+
+  function walk(e: MetricExpr) {
+    switch (e.kind) {
+      case "Literal":
+        return;
+      case "AttrRef":
+        attrs.add(e.name);
+        return;
+      case "MetricRef":
+        deps.add(e.name);
+        return;
+      case "Call":
+        e.args.forEach(walk);
+        return;
+      case "BinaryOp":
+        walk(e.left);
+        walk(e.right);
+        return;
+    }
+  }
+
+  walk(expr);
+  return { attrs, deps };
 }
 
 /* --------------------------------------------------------------------------
@@ -504,6 +551,118 @@ function aggregate(
     default:
       return undefined;
   }
+}
+
+function aggregateRows(
+  rows: RowSequence,
+  attr: string | null,
+  op: AggregationOperator
+): number | undefined {
+  const values = rows
+    .select((r: Row) => (attr ? Number((r as any)[attr]) : 1))
+    .where((num: number) => !Number.isNaN(num))
+    .toArray();
+
+  if (values.length === 0) return undefined;
+
+  switch (op) {
+    case "sum":
+      return values.reduce((a, b) => a + b, 0);
+    case "avg":
+      return values.reduce((a, b) => a + b, 0) / values.length;
+    case "min":
+      return Math.min(...values);
+    case "max":
+      return Math.max(...values);
+    case "count":
+      return values.length;
+    default:
+      return undefined;
+  }
+}
+
+function evalBinary(
+  op: "+" | "-" | "*" | "/",
+  left?: number,
+  right?: number
+): number | undefined {
+  if (left == null || right == null) return undefined;
+  switch (op) {
+    case "+":
+      return left + right;
+    case "-":
+      return left - right;
+    case "*":
+      return left * right;
+    case "/":
+      return right === 0 ? undefined : left / right;
+    default:
+      return undefined;
+  }
+}
+
+export function compileMetricExpr(expr: MetricExpr): MetricEvalV2 {
+  const evaluator = (node: MetricExpr, ctx: MetricComputationContext): number | undefined => {
+    switch (node.kind) {
+      case "Literal":
+        return node.value;
+      case "AttrRef":
+        return Number(ctx.groupKey[node.name]);
+      case "MetricRef":
+        return ctx.evalMetric(node.name);
+      case "BinaryOp":
+        return evalBinary(
+          node.op,
+          evaluator(node.left, ctx),
+          evaluator(node.right, ctx)
+        );
+      case "Call": {
+        const fn = node.fn.toLowerCase();
+        if (["sum", "avg", "min", "max", "count"].includes(fn)) {
+          const [arg] = node.args;
+          const attr = arg?.kind === "AttrRef" ? arg.name : null;
+          const effectiveAttr = fn === "count" && (attr === null || attr === "*") ? null : attr;
+          return aggregateRows(ctx.rows, effectiveAttr, fn as AggregationOperator);
+        }
+        if (fn === "last_year") {
+          const metricArg = node.args[0];
+          if (metricArg?.kind !== "MetricRef") return undefined;
+          const cacheLabel = `last_year(${metricArg.name})`;
+          const transformed = ctx.helpers.applyRowsetTransform("last_year", ctx.groupKey);
+          return evaluateMetricRuntime(
+            metricArg.name,
+            ctx.helpers.runtime,
+            ctx.groupKey,
+            transformed,
+            cacheLabel
+          );
+        }
+        const evaluatedArgs = node.args.map((a) => evaluator(a, ctx) ?? 0);
+        if (fn === "last_year" && evaluatedArgs.length === 1) {
+          return evaluatedArgs[0];
+        }
+        return undefined;
+      }
+    }
+  };
+
+  return (ctx) => evaluator(expr, ctx);
+}
+
+export function buildMetricFromExpr(opts: {
+  name: string;
+  baseFact?: string;
+  expr: MetricExpr;
+}): MetricDefinitionV2 {
+  const { attrs, deps } = collectAttrsAndDeps(opts.expr);
+  return {
+    name: opts.name,
+    baseFact: opts.baseFact,
+    attributes: Array.from(attrs),
+    deps: Array.from(deps),
+    exprAst: opts.expr,
+    eval: compileMetricExpr(opts.expr),
+  };
 }
 
 /**

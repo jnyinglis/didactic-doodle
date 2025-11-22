@@ -1,12 +1,13 @@
 import {
   FilterContext,
   FilterNode,
+  MetricExpr,
   MetricDefinitionV2,
-  MetricEvalV2,
   QuerySpecV2,
-  evaluateMetricRuntime,
+  SemanticModel,
+  MetricRegistry,
+  buildMetricFromExpr,
 } from "./semanticEngine";
-import type { RowSequence } from "./semanticEngine";
 
 export type Parser<T> = {
   parse(input: string, pos: number): { value: T; nextPos: number } | null;
@@ -184,18 +185,21 @@ function skipWs(input: string, pos: number): number {
  * AST TYPES
  * -------------------------------------------------------------------------- */
 
-export type MetricExpr =
-  | { kind: "Literal"; value: number }
-  | { kind: "AttrRef"; name: string }
-  | { kind: "MetricRef"; name: string }
-  | { kind: "Call"; fn: string; args: MetricExpr[] }
-  | { kind: "BinaryOp"; op: "+" | "-" | "*" | "/"; left: MetricExpr; right: MetricExpr }
+export type UnresolvedMetricExpr =
+  | MetricExpr
+  | { kind: "Call"; fn: string; args: UnresolvedMetricExpr[] }
+  | { kind: "BinaryOp"; op: "+" | "-" | "*" | "/"; left: UnresolvedMetricExpr; right: UnresolvedMetricExpr }
   | { kind: "UnresolvedIdent"; name: string };
 
 export interface MetricDefAst {
   name: string;
   baseFact?: string;
-  expr: MetricExpr;
+  expr: UnresolvedMetricExpr;
+}
+
+export interface DslFileAst {
+  metrics: MetricDefAst[];
+  queries: QueryAst[];
 }
 
 export type MetricHavingAst =
@@ -219,9 +223,9 @@ const numberLiteral = map(seq(whitespace, regex(/\d+(?:\.\d+)?/)), ([, v]) => Nu
  * EXPRESSION PARSER
  * -------------------------------------------------------------------------- */
 
-const expr: Parser<MetricExpr> = lazy(() => additive);
+const expr: Parser<UnresolvedMetricExpr> = lazy(() => additive);
 
-const functionCall: Parser<MetricExpr> = {
+const functionCall: Parser<UnresolvedMetricExpr> = {
   parse(input, pos) {
     const nameRes = identifier.parse(input, pos);
     if (!nameRes) return null;
@@ -230,7 +234,7 @@ const functionCall: Parser<MetricExpr> = {
 
     const fn = nameRes.value;
     let nextPos = lp.nextPos;
-    let args: MetricExpr[] = [];
+    let args: UnresolvedMetricExpr[] = [];
 
     if (fn === "last_year") {
       const metricArg = expr.parse(input, nextPos);
@@ -265,34 +269,44 @@ const functionCall: Parser<MetricExpr> = {
   },
 };
 
-const primary: Parser<MetricExpr> = choice(
+const primary: Parser<UnresolvedMetricExpr> = choice(
   between(symbol("("), expr, symbol(")")),
   functionCall,
-  map(numberLiteral, (n) => ({ kind: "Literal", value: n } as MetricExpr)),
-  map(identifier, (name) => ({ kind: "UnresolvedIdent", name } as MetricExpr))
+  map(numberLiteral, (n) => ({ kind: "Literal", value: n } as UnresolvedMetricExpr)),
+  map(identifier, (name) => ({ kind: "UnresolvedIdent", name } as UnresolvedMetricExpr))
 );
 
-const multiplicative: Parser<MetricExpr> = map(
+const multiplicative: Parser<UnresolvedMetricExpr> = map(
   chainLeft(primary, choice(symbol("*"), symbol("/"))),
   (node: any) => {
     if (node.op) {
-      return { kind: "BinaryOp", op: node.op, left: node.left, right: node.right } as MetricExpr;
+      return {
+        kind: "BinaryOp",
+        op: node.op,
+        left: node.left,
+        right: node.right,
+      } as UnresolvedMetricExpr;
     }
-    return node as MetricExpr;
+    return node as UnresolvedMetricExpr;
   }
 );
 
-const additive: Parser<MetricExpr> = map(
+const additive: Parser<UnresolvedMetricExpr> = map(
   chainLeft(multiplicative, choice(symbol("+"), symbol("-"))),
   (node: any) => {
     if (node.op) {
-      return { kind: "BinaryOp", op: node.op, left: node.left, right: node.right } as MetricExpr;
+      return {
+        kind: "BinaryOp",
+        op: node.op,
+        left: node.left,
+        right: node.right,
+      } as UnresolvedMetricExpr;
     }
-    return node as MetricExpr;
+    return node as UnresolvedMetricExpr;
   }
 );
 
-const argList: Parser<MetricExpr[]> = sepBy(expr, symbol(","));
+const argList: Parser<UnresolvedMetricExpr[]> = sepBy(expr, symbol(","));
 
 /* --------------------------------------------------------------------------
  * METRIC DEF PARSER
@@ -432,7 +446,10 @@ export const queryDef: Parser<QueryAst> = {
  * NAME RESOLUTION
  * -------------------------------------------------------------------------- */
 
-export function resolveMetricExpr(expr: MetricExpr, metricNames: Set<string>): MetricExpr {
+export function resolveMetricExpr(
+  expr: UnresolvedMetricExpr,
+  metricNames: Set<string>
+): MetricExpr {
   switch (expr.kind) {
     case "UnresolvedIdent":
       return metricNames.has(expr.name)
@@ -440,149 +457,33 @@ export function resolveMetricExpr(expr: MetricExpr, metricNames: Set<string>): M
         : { kind: "AttrRef", name: expr.name };
     case "BinaryOp":
       return {
-        ...expr,
+        kind: "BinaryOp",
+        op: expr.op,
         left: resolveMetricExpr(expr.left, metricNames),
         right: resolveMetricExpr(expr.right, metricNames),
       };
     case "Call":
-      return { ...expr, args: expr.args.map((a) => resolveMetricExpr(a, metricNames)) };
+      return {
+        kind: "Call",
+        fn: expr.fn,
+        args: expr.args.map((a) => resolveMetricExpr(a, metricNames)),
+      };
     default:
       return expr;
   }
-}
-
-export function collectAttributes(expr: MetricExpr, acc: Set<string> = new Set()): Set<string> {
-  switch (expr.kind) {
-    case "AttrRef":
-      acc.add(expr.name);
-      break;
-    case "BinaryOp":
-      collectAttributes(expr.left, acc);
-      collectAttributes(expr.right, acc);
-      break;
-    case "Call":
-      expr.args.forEach((a) => collectAttributes(a, acc));
-      break;
-  }
-  return acc;
-}
-
-export function collectDeps(expr: MetricExpr, acc: Set<string> = new Set()): Set<string> {
-  switch (expr.kind) {
-    case "MetricRef":
-      acc.add(expr.name);
-      break;
-    case "BinaryOp":
-      collectDeps(expr.left, acc);
-      collectDeps(expr.right, acc);
-      break;
-    case "Call":
-      expr.args.forEach((a) => collectDeps(a, acc));
-      break;
-  }
-  return acc;
 }
 
 /* --------------------------------------------------------------------------
  * COMPILATION
  * -------------------------------------------------------------------------- */
 
-function aggregateRows(rows: RowSequence, attr: string | null, op: "sum" | "avg" | "min" | "max" | "count") {
-  const values = rows
-    .select((r: any) => (attr ? Number(r[attr]) : 1))
-    .where((v: number) => !Number.isNaN(v))
-    .toArray();
-  if (values.length === 0) return undefined;
-  switch (op) {
-    case "sum":
-      return values.reduce((a, b) => a + b, 0);
-    case "avg":
-      return values.reduce((a, b) => a + b, 0) / values.length;
-    case "min":
-      return Math.min(...values);
-    case "max":
-      return Math.max(...values);
-    case "count":
-      return values.length;
-  }
-}
-
-function evalBinary(op: string, left?: number, right?: number): number | undefined {
-  if (left == null || right == null) return undefined;
-  switch (op) {
-    case "+":
-      return left + right;
-    case "-":
-      return left - right;
-    case "*":
-      return left * right;
-    case "/":
-      return right === 0 ? undefined : left / right;
-    default:
-      return undefined;
-  }
-}
-
-export function compileMetricExpr(expr: MetricExpr): MetricEvalV2 {
-  const evaluator = (node: MetricExpr, ctx: any): number | undefined => {
-    switch (node.kind) {
-      case "Literal":
-        return node.value;
-      case "AttrRef": {
-        const first = ctx.rows.first ? ctx.rows.first() : ctx.rows.toArray?.()?.[0];
-        return first ? Number((first as any)[node.name]) : undefined;
-      }
-      case "MetricRef":
-        return ctx.evalMetric(node.name);
-      case "BinaryOp":
-        return evalBinary(node.op, evaluator(node.left, ctx), evaluator(node.right, ctx));
-      case "Call": {
-        const fn = node.fn.toLowerCase();
-        if (["sum", "avg", "min", "max", "count"].includes(fn)) {
-          const [arg] = node.args;
-          const attr = arg?.kind === "AttrRef" ? arg.name : null;
-          const effectiveAttr = fn === "count" && (attr === null || attr === "*") ? null : attr;
-          return aggregateRows(ctx.rows, effectiveAttr, fn as any);
-        }
-        if (fn === "last_year") {
-          const metricArg = node.args[0];
-          if (metricArg?.kind !== "MetricRef") return undefined;
-          const cacheLabel = `last_year(${metricArg.name})`;
-          const transformed = ctx.helpers.applyRowsetTransform("last_year", ctx.groupKey);
-          return evaluateMetricRuntime(
-            metricArg.name,
-            ctx.helpers.runtime,
-            ctx.groupKey,
-            transformed,
-            cacheLabel
-          );
-        }
-        const evaluatedArgs = node.args.map((a) => evaluator(a, ctx) ?? 0);
-        if (fn === "last_year" && evaluatedArgs.length === 1) {
-          return evaluatedArgs[0];
-        }
-        return undefined;
-      }
-      default:
-        return undefined;
-    }
-  };
-
-  return (ctx) => evaluator(expr, ctx);
-}
-
 export function buildMetricDefinition(ast: MetricDefAst, metricNames: Set<string>): MetricDefinitionV2 {
   const resolved = resolveMetricExpr(ast.expr, metricNames);
-  const attributes = Array.from(collectAttributes(resolved));
-  const deps = Array.from(collectDeps(resolved));
-  return {
+  return buildMetricFromExpr({
     name: ast.name,
     baseFact: ast.baseFact,
-    attributes,
-    deps,
-    exprAst: resolved,
-    eval: compileMetricExpr(resolved),
-  };
+    expr: resolved,
+  });
 }
 
 export function compileHaving(ast: MetricHavingAst): (values: Record<string, number | undefined>) => boolean {
@@ -673,6 +574,78 @@ function foldHaving(node: any, kind: "And" | "Or"): MetricHavingAst {
     }
   }
   return { kind, items } as MetricHavingAst;
+}
+
+/* --------------------------------------------------------------------------
+ * FILE PARSER + COMPILATION ENTRY POINTS
+ * -------------------------------------------------------------------------- */
+
+const fileParser: Parser<DslFileAst> = {
+  parse(input, pos) {
+    let nextPos = skipWs(input, pos);
+    const metrics: MetricDefAst[] = [];
+    const queries: QueryAst[] = [];
+
+    while (nextPos < input.length) {
+      const metric = metricDef.parse(input, nextPos);
+      if (metric) {
+        metrics.push(metric.value);
+        nextPos = metric.nextPos;
+        continue;
+      }
+      const query = queryDef.parse(input, nextPos);
+      if (query) {
+        queries.push(query.value);
+        nextPos = query.nextPos;
+        continue;
+      }
+      break;
+    }
+
+    nextPos = skipWs(input, nextPos);
+    return { value: { metrics, queries }, nextPos };
+  },
+};
+
+export function parseDsl(text: string): DslFileAst {
+  const result = fileParser.parse(text, 0);
+  if (!result || skipWs(text, result.nextPos) !== text.length) {
+    throw new Error("DSL parse error (TODO: better error reporting)");
+  }
+  return result.value;
+}
+
+export function compileDslToModel(
+  text: string,
+  baseModel: SemanticModel
+): { model: SemanticModel; queries: Record<string, QuerySpecV2> } {
+  const ast = parseDsl(text);
+  const metricNames = new Set([
+    ...Object.keys(baseModel.metrics ?? {}),
+    ...ast.metrics.map((m) => m.name),
+  ]);
+
+  const newMetrics: MetricRegistry = { ...baseModel.metrics };
+  ast.metrics.forEach((mAst) => {
+    const def = buildMetricFromExpr({
+      name: mAst.name,
+      baseFact: mAst.baseFact,
+      expr: resolveMetricExpr(mAst.expr, metricNames),
+    });
+    newMetrics[def.name] = def;
+  });
+
+  const queries: Record<string, QuerySpecV2> = {};
+  ast.queries.forEach((qAst) => {
+    queries[qAst.name] = qAst.spec;
+  });
+
+  const model: SemanticModel = {
+    ...baseModel,
+    metrics: newMetrics,
+  };
+
+  return { model, queries };
 }
 
 export function parseAll<T>(parser: Parser<T>, input: string): T {
