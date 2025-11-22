@@ -1,5 +1,5 @@
-// semanticEngineV2.ts
-// Minimal V2-only semantic metrics engine
+// semanticEngine.ts
+// Minimal semantic metrics engine
 //
 // Key ideas:
 //
@@ -224,7 +224,7 @@ export interface InMemoryDb {
 }
 
 /* --------------------------------------------------------------------------
- * SEMANTIC MODEL V2
+ * SEMANTIC MODEL
  * -------------------------------------------------------------------------- */
 
 /**
@@ -259,23 +259,23 @@ export interface RowsetTransformDefinition {
   factKey: string;     // logical attribute on fact rows to filter by (e.g. tradyrwkcode)
 }
 
-export interface SemanticModelV2 {
+export interface SemanticModel {
   facts: Record<string, FactRelation>;
   dimensions: Record<string, { name: string }>;
   attributes: Record<string, LogicalAttribute>;
   joins: JoinEdge[];
-  metricsV2: MetricRegistryV2;
+  metrics: MetricRegistry;
   rowsetTransforms?: Record<string, RowsetTransformDefinition>;
 }
 
 /* --------------------------------------------------------------------------
- * METRICS (V2, GRAIN-AGNOSTIC)
+ * METRICS (GRAIN-AGNOSTIC)
  * -------------------------------------------------------------------------- */
 
 export type AggregationOperator = "sum" | "avg" | "count" | "min" | "max";
 
-export interface MetricRuntimeV2 {
-  model: SemanticModelV2;
+export interface MetricRuntime {
+  model: SemanticModel;
   db: InMemoryDb;
   relation: RowSequence;        // joined + where-filtered relation
   whereFilter: FilterNode | null;
@@ -290,23 +290,23 @@ export interface MetricComputationContext {
   helpers: MetricComputationHelpers;
 }
 
-export type MetricEvalV2 = (
+export type MetricEval = (
   ctx: MetricComputationContext
 ) => number | undefined;
 
-export interface MetricDefinitionV2 {
+export interface MetricDefinition {
   name: string;
   description?: string;
   baseFact?: string;      // which fact this metric is tied to (for fact-based metrics)
   attributes?: string[];  // logical attributes this metric depends on
   deps?: string[];        // dependent metrics
-  eval: MetricEvalV2;
+  eval: MetricEval;
 }
 
-export type MetricRegistryV2 = Record<string, MetricDefinitionV2>;
+export type MetricRegistry = Record<string, MetricDefinition>;
 
 export interface MetricComputationHelpers {
-  runtime: MetricRuntimeV2;
+  runtime: MetricRuntime;
   applyRowsetTransform(
     transformId: string,
     groupKey: Record<string, any>
@@ -314,10 +314,10 @@ export interface MetricComputationHelpers {
 }
 
 /* --------------------------------------------------------------------------
- * QUERY SPEC (V2)
+ * QUERY SPEC
  * -------------------------------------------------------------------------- */
 
-export interface QuerySpecV2 {
+export interface QuerySpec {
   dimensions: string[];                          // logical attributes for grain
   metrics: string[];                             // metric names
   where?: FilterContext;                         // attribute-level filter
@@ -378,7 +378,7 @@ function mapLogicalAttributes(
  * Assumes joins are from baseFact -> dimension using JoinEdge.
  */
 function buildFactBaseRelation(
-  model: SemanticModelV2,
+  model: SemanticModel,
   db: InMemoryDb,
   baseFact: string,
   requiredAttributes: Set<string>
@@ -444,7 +444,7 @@ function buildFactBaseRelation(
  * there are no metrics and all attributes live on that one table.
  */
 function buildDimensionBaseRelation(
-  model: SemanticModelV2,
+  model: SemanticModel,
   db: InMemoryDb,
   relationName: string,
   requiredAttributes: Set<string>
@@ -509,7 +509,7 @@ export function aggregateMetric(
   attr: string,
   op: AggregationOperator = "sum",
   baseFact?: string
-): MetricDefinitionV2 {
+): MetricDefinition {
   return {
     name,
     attributes: [attr],
@@ -527,7 +527,7 @@ export function rowsetTransformMetric(opts: {
   baseMetric: string;
   transformId: string;
   description?: string;
-}): MetricDefinitionV2 {
+}): MetricDefinition {
   return {
     name: opts.name,
     deps: [opts.baseMetric],
@@ -538,7 +538,7 @@ export function rowsetTransformMetric(opts: {
         ctx.groupKey
       );
       const cacheLabel = `${opts.name}:transform`;
-      const value = evaluateMetricV2(
+      const value = evaluateMetric(
         opts.baseMetric,
         ctx.helpers.runtime,
         ctx.groupKey,
@@ -551,7 +551,7 @@ export function rowsetTransformMetric(opts: {
 }
 
 function applyRowsetTransform(
-  runtime: MetricRuntimeV2,
+  runtime: MetricRuntime,
   transformId: string,
   groupKey: Record<string, any>
 ): RowSequence {
@@ -591,18 +591,18 @@ function applyRowsetTransform(
 }
 
 /* --------------------------------------------------------------------------
- * METRIC EVALUATION (V2)
+ * METRIC EVALUATION
  * -------------------------------------------------------------------------- */
 
-function evaluateMetricV2(
+function evaluateMetric(
   metricName: string,
-  runtime: MetricRuntimeV2,
+  runtime: MetricRuntime,
   groupKey: Record<string, any>,
   rows: RowSequence,
   cacheLabel?: string,
   cache?: Map<string, number | undefined>
 ): number | undefined {
-  const registry = runtime.model.metricsV2;
+  const registry = runtime.model.metrics;
   const metric = registry[metricName];
   if (!metric) {
     throw new Error(`Unknown metric: ${metricName}`);
@@ -617,7 +617,7 @@ function evaluateMetricV2(
   }
 
   const evalMetric = (dep: string) =>
-    evaluateMetricV2(dep, runtime, groupKey, rows, undefined, workingCache);
+    evaluateMetric(dep, runtime, groupKey, rows, undefined, workingCache);
 
   const helpers: MetricComputationHelpers = {
     runtime,
@@ -631,12 +631,12 @@ function evaluateMetricV2(
 }
 
 /* --------------------------------------------------------------------------
- * MAIN QUERY EXECUTION (V2)
+ * MAIN QUERY EXECUTION
  * -------------------------------------------------------------------------- */
 
 export function runSemanticQuery(
-  env: { db: InMemoryDb; model: SemanticModelV2 },
-  spec: QuerySpecV2
+  env: { db: InMemoryDb; model: SemanticModel },
+  spec: QuerySpec
 ): Row[] {
   const { db, model } = env;
   const dimensions = spec.dimensions;
@@ -647,7 +647,7 @@ export function runSemanticQuery(
   const metricsByFact = new Map<string | undefined, string[]>();
 
   spec.metrics.forEach((m) => {
-    const def = model.metricsV2[m];
+    const def = model.metrics[m];
     const fact = def?.baseFact;
     const list = metricsByFact.get(fact) ?? [];
     list.push(m);
@@ -766,7 +766,7 @@ export function runSemanticQuery(
         dimensions.forEach((d) => (groupKey[d] = (sample as any)[d]));
       }
 
-      const runtime: MetricRuntimeV2 = {
+      const runtime: MetricRuntime = {
         model,
         db,
         baseFact: undefined,
@@ -778,7 +778,7 @@ export function runSemanticQuery(
       const metricValues: Record<string, number | undefined> = {};
       const metricCache = new Map<string, number | undefined>();
       (metricsByFact.get(undefined) ?? []).forEach((m) => {
-        metricValues[m] = evaluateMetricV2(
+        metricValues[m] = evaluateMetric(
           m,
           runtime,
           groupKey,
@@ -840,7 +840,7 @@ export function runSemanticQuery(
     const keyStr = keyFromGroup(groupKey);
     frameGroupLookup.set(keyStr, group);
 
-    const runtime: MetricRuntimeV2 = {
+    const runtime: MetricRuntime = {
       model,
       db,
       baseFact: primaryFact,
@@ -853,7 +853,7 @@ export function runSemanticQuery(
     const metricCache = new Map<string, number | undefined>();
 
     (metricsByFact.get(primaryFact) ?? []).forEach((m) => {
-      metricValues[m] = evaluateMetricV2(
+      metricValues[m] = evaluateMetric(
         m,
         runtime,
         groupKey,
@@ -903,7 +903,7 @@ export function runSemanticQuery(
       dimensions.forEach((d) => (groupKey[d] = (sample as any)[d]));
       const keyStr = keyFromGroup(groupKey);
 
-      const runtime: MetricRuntimeV2 = {
+      const runtime: MetricRuntime = {
         model,
         db,
         baseFact: fact,
@@ -916,7 +916,7 @@ export function runSemanticQuery(
       const values: Record<string, number | undefined> = {};
 
       metricNames.forEach((m) => {
-        values[m] = evaluateMetricV2(
+        values[m] = evaluateMetric(
           m,
           runtime,
           groupKey,
@@ -946,7 +946,7 @@ export function runSemanticQuery(
       const keyStr = keyFromGroup(groupKey);
       const group = frameGroupLookup.get(keyStr) ?? rowsToEnumerable([]);
 
-      const runtime: MetricRuntimeV2 = {
+      const runtime: MetricRuntime = {
         model,
         db,
         baseFact: undefined,
@@ -957,7 +957,7 @@ export function runSemanticQuery(
 
       const metricCache = new Map<string, number | undefined>();
       dimensionMetrics.forEach((m) => {
-        row[m] = evaluateMetricV2(
+        row[m] = evaluateMetric(
           m,
           runtime,
           groupKey,

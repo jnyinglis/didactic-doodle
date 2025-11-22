@@ -3,11 +3,11 @@ import {
   aggregateMetric,
   InMemoryDb,
   LogicalAttribute,
-  MetricDefinitionV2,
-  QuerySpecV2,
-  SemanticModelV2,
+  MetricDefinition,
+  QuerySpec,
+  SemanticModel,
   runSemanticQuery,
-} from "../src/semanticEngineV2";
+} from "../src/semanticEngine";
 
 const db: InMemoryDb = {
   tables: {
@@ -49,7 +49,7 @@ const totalOnHand = aggregateMetric(
   "fact_inventory"
 );
 
-const storeNameLength: MetricDefinitionV2 = {
+const storeNameLength: MetricDefinition = {
   name: "storeNameLength",
   attributes: ["storeName"],
   eval: ({ groupKey }) =>
@@ -58,7 +58,7 @@ const storeNameLength: MetricDefinitionV2 = {
       : undefined,
 };
 
-const model: SemanticModelV2 = {
+const model: SemanticModel = {
   facts: { fact_sales: { name: "fact_sales" }, fact_inventory: { name: "fact_inventory" } },
   dimensions: { dim_store: { name: "dim_store" } },
   attributes,
@@ -71,16 +71,16 @@ const model: SemanticModelV2 = {
       dimensionKey: "id",
     },
   ],
-  metricsV2: {
+  metrics: {
     totalSales,
     totalOnHand,
     storeNameLength,
   },
 };
 
-describe("semanticEngineV2 multi-fact", () => {
+describe("semanticEngine multi-fact", () => {
   it("evaluates metrics per fact and joins by dimensions", () => {
-    const spec: QuerySpecV2 = {
+    const spec: QuerySpec = {
       dimensions: ["storeId", "storeName"],
       metrics: ["totalSales", "totalOnHand", "storeNameLength"],
     };
@@ -105,7 +105,7 @@ describe("semanticEngineV2 multi-fact", () => {
   });
 
   it("keeps the primary fact as the frame when other facts have extra rows", () => {
-    const spec: QuerySpecV2 = {
+    const spec: QuerySpec = {
       dimensions: ["storeId"],
       metrics: ["totalSales", "totalOnHand"],
     };

@@ -2,10 +2,10 @@ import {
   aggregateMetric,
   InMemoryDb,
   LogicalAttribute,
-  QuerySpecV2,
-  SemanticModelV2,
+  QuerySpec,
+  SemanticModel,
   runSemanticQuery,
-} from "./semanticEngineV2";
+} from "./semanticEngine";
 
 const db: InMemoryDb = {
   tables: {
@@ -32,7 +32,7 @@ const attributes: Record<string, LogicalAttribute> = {
   storeName: { name: "storeName", relation: "dim_store", column: "storeName" },
 };
 
-const model: SemanticModelV2 = {
+const model: SemanticModel = {
   facts: {
     fact_orders: { name: "fact_orders" },
     fact_returns: { name: "fact_returns" },
@@ -43,16 +43,16 @@ const model: SemanticModelV2 = {
     { fact: "fact_orders", dimension: "dim_store", factKey: "storeId", dimensionKey: "id" },
     { fact: "fact_returns", dimension: "dim_store", factKey: "storeId", dimensionKey: "id" },
   ],
-  metricsV2: {
+  metrics: {
     totalSales: aggregateMetric("totalSales", "amount", "sum", "fact_orders"),
     totalRefunds: aggregateMetric("totalRefunds", "refund", "sum", "fact_returns"),
   },
 };
 
-const spec: QuerySpecV2 = {
+const spec: QuerySpec = {
   dimensions: ["storeId", "storeName"],
   metrics: ["totalSales", "totalRefunds"],
 };
 
 const rows = runSemanticQuery({ db, model }, spec);
-console.log("semanticEngineV2 demo output:", rows);
+console.log("semanticEngine demo output:", rows);
