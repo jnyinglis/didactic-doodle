@@ -1,6 +1,4 @@
-Here’s the same design, but with **retail sales** terminology instead of the assessment/education wording.
 
----
 
 ## 1. Core design (finalized)
 
