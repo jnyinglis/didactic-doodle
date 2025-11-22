@@ -22,6 +22,7 @@ import {
   tableTransformMetric,
   defineTableTransform,
   defineTableTransformFromRelation,
+  WindowFrameSpec,
 } from "../src/semanticEngine";
 
 const db: InMemoryDb = {
@@ -139,6 +140,136 @@ const validationModelBase: SemanticModel = {
   ],
   metrics: {},
 };
+
+describe("window functions", () => {
+  const db: InMemoryDb = {
+    tables: {
+      fact_sales: [
+        { storeId: 1, week: 1, salesAmount: 10 },
+        { storeId: 1, week: 2, salesAmount: 20 },
+        { storeId: 1, week: 3, salesAmount: 30 },
+        { storeId: 2, week: 1, salesAmount: 5 },
+        { storeId: 2, week: 2, salesAmount: 15 },
+      ],
+      dim_store: [
+        { id: 1, storeName: "Downtown" },
+        { id: 2, storeName: "Mall" },
+      ],
+      dim_week: [{ id: 1 }, { id: 2 }, { id: 3 }],
+    },
+  };
+
+  const attributes: Record<string, LogicalAttribute> = {
+    storeId: { table: "dim_store", column: "id" },
+    salesAmount: { table: "fact_sales" },
+    week: { table: "dim_week", column: "id" },
+    storeName: { table: "dim_store" },
+  };
+
+  const sales = aggregateMetric("sales", "fact_sales", "salesAmount", "sum");
+
+  const model: SemanticModel = {
+    facts: { fact_sales: { table: "fact_sales" } },
+    dimensions: { dim_store: { table: "dim_store" }, dim_week: { table: "dim_week" } },
+    attributes,
+    joins: [
+      { fact: "fact_sales", dimension: "dim_store", factKey: "storeId", dimensionKey: "id" },
+      { fact: "fact_sales", dimension: "dim_week", factKey: "week", dimensionKey: "id" },
+    ],
+    metrics: {
+      sales,
+      rollingSales: buildMetricFromExpr({
+        name: "rollingSales",
+        baseFact: "fact_sales",
+        expr: Expr.window(Expr.metric("sales"), {
+          partitionBy: ["storeId"],
+          orderBy: "week",
+          frame: { kind: "rolling", count: 2 },
+          aggregate: "sum",
+        }),
+      }),
+      runningSales: buildMetricFromExpr({
+        name: "runningSales",
+        baseFact: "fact_sales",
+        expr: Expr.window(Expr.metric("sales"), {
+          partitionBy: ["storeId"],
+          orderBy: "week",
+          frame: { kind: "cumulative" },
+          aggregate: "sum",
+        }),
+      }),
+      prevSales: buildMetricFromExpr({
+        name: "prevSales",
+        baseFact: "fact_sales",
+        expr: Expr.window(Expr.metric("sales"), {
+          partitionBy: ["storeId"],
+          orderBy: "week",
+          frame: { kind: "offset", offset: -1 },
+          aggregate: "sum",
+        }),
+      }),
+    },
+  };
+
+  it("computes rolling, cumulative, and offset windows per partition", () => {
+    const rows = runSemanticQuery(
+      { db, model },
+      { dimensions: ["storeId", "week"], metrics: ["sales", "rollingSales", "runningSales", "prevSales"] }
+    );
+
+    const getRow = (storeId: number, week: number) =>
+      rows.find((r) => r.storeId === storeId && r.week === week) ?? {};
+
+    expect(getRow(1, 1)).to.include({ sales: 10, rollingSales: 10, runningSales: 10 });
+    expect(getRow(1, 1).prevSales).to.equal(undefined);
+    expect(getRow(1, 2)).to.include({ sales: 20, rollingSales: 30, runningSales: 30 });
+    expect(getRow(1, 2).prevSales).to.equal(10);
+    expect(getRow(1, 3)).to.include({ sales: 30, rollingSales: 50, runningSales: 60 });
+    expect(getRow(1, 3).prevSales).to.equal(20);
+
+    expect(getRow(2, 1)).to.include({ sales: 5, rollingSales: 5, runningSales: 5 });
+    expect(getRow(2, 1).prevSales).to.equal(undefined);
+    expect(getRow(2, 2)).to.include({ sales: 15, rollingSales: 20, runningSales: 20 });
+    expect(getRow(2, 2).prevSales).to.equal(5);
+  });
+
+  it("validates window frame inputs", () => {
+    const badFrame: WindowFrameSpec = { kind: "rolling", count: 0 } as any;
+    expect(() =>
+      buildMetricFromExpr({
+        name: "bad", baseFact: "fact_sales", expr: Expr.window(Expr.metric("sales"), {
+          partitionBy: [],
+          orderBy: "week",
+          frame: badFrame,
+          aggregate: "sum",
+        }),
+      })
+    ).to.throw("rolling window count must be a positive integer");
+  });
+
+  it("surfaces validation errors for unreachable window attributes", () => {
+    const totalSales = aggregateMetric("totalSales", "fact_sales", "salesAmount", "sum");
+    const badMetric = buildMetricFromExpr({
+      name: "badWindow",
+      baseFact: "fact_sales",
+      expr: Expr.window(Expr.metric("totalSales"), {
+        partitionBy: ["storeId"],
+        orderBy: "unreachableAttr",
+        frame: { kind: "rolling", count: 2 },
+        aggregate: "sum",
+      }),
+    });
+
+    const modelWithError: SemanticModel = {
+      ...validationModelBase,
+      metrics: { totalSales, badWindow: badMetric },
+    };
+
+    const result = validateMetric(modelWithError, "badWindow");
+    expect(result.ok).to.equal(false);
+    expect(result.errors.some((e) => e.message.includes("unreachableAttr"))).to.equal(true);
+  });
+});
 
 describe("metric builders", () => {
   it("creates aggregate metrics backed by MetricExpr", () => {

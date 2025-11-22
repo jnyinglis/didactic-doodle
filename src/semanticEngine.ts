@@ -365,6 +365,11 @@ export interface SemanticModel {
 
 export type AggregationOperator = "sum" | "avg" | "count" | "min" | "max";
 
+export type WindowFrameSpec =
+  | { kind: "rolling"; count: number }
+  | { kind: "cumulative" }
+  | { kind: "offset"; offset: number };
+
 export interface MetricRuntime {
   model: SemanticModel;
   db: InMemoryDb;
@@ -428,6 +433,14 @@ export type MetricExpr =
   | { kind: "AttrRef"; name: string }
   | { kind: "MetricRef"; name: string }
   | { kind: "Call"; fn: string; args: MetricExpr[] }
+  | {
+      kind: "Window";
+      base: MetricExpr;
+      partitionBy: string[];
+      orderBy: string;
+      frame: WindowFrameSpec;
+      aggregate: AggregationOperator;
+    }
   | {
       kind: "BinaryOp";
       op: "+" | "-" | "*" | "/";
@@ -513,6 +526,25 @@ export const Expr = {
       outputAttr,
     } as MetricExpr;
   },
+
+  window(
+    base: MetricExpr,
+    opts: {
+      partitionBy?: string[];
+      orderBy: string;
+      frame: WindowFrameSpec;
+      aggregate: AggregationOperator;
+    }
+  ): MetricExpr {
+    return {
+      kind: "Window",
+      base,
+      partitionBy: opts.partitionBy ?? [],
+      orderBy: opts.orderBy,
+      frame: opts.frame,
+      aggregate: opts.aggregate,
+    } as MetricExpr;
+  },
 };
 
 export interface MetricReferenceSummary {
@@ -555,6 +587,11 @@ export function collectMetricReferences(expr: MetricExpr): MetricReferenceSummar
         e.args.forEach(walk);
         return;
       }
+      case "Window":
+        e.partitionBy.forEach((attr) => attrs.add(attr));
+        attrs.add(e.orderBy);
+        walk(e.base);
+        return;
       case "BinaryOp":
         walk(e.left);
         walk(e.right);
@@ -840,6 +877,177 @@ function aggregateRows(
   }
 }
 
+function aggregateWindowValues(
+  values: Array<number | undefined>,
+  op: AggregationOperator
+): number | undefined {
+  const defined = values
+    .filter((v): v is number => v !== undefined && !Number.isNaN(v))
+    .map((v) => Number(v));
+
+  if (op === "count") return defined.length;
+  if (!defined.length) return undefined;
+
+  switch (op) {
+    case "sum":
+      return defined.reduce((a, b) => a + b, 0);
+    case "avg":
+      return defined.reduce((a, b) => a + b, 0) / defined.length;
+    case "min":
+      return Math.min(...defined);
+    case "max":
+      return Math.max(...defined);
+    default:
+      return undefined;
+  }
+}
+
+function validateWindowFrame(frame: WindowFrameSpec): void {
+  if (!frame || typeof frame !== "object") {
+    throw new Error("windowBy() frame must be provided");
+  }
+
+  if (frame.kind === "rolling") {
+    if (!Number.isInteger(frame.count) || frame.count <= 0) {
+      throw new Error("rolling window count must be a positive integer");
+    }
+  } else if (frame.kind === "offset") {
+    if (!Number.isInteger(frame.offset)) {
+      throw new Error("offset window requires an integer offset");
+    }
+  }
+}
+
+function normalizeWindowFrame(
+  frame: WindowFrameSpec
+): { mode: "offset"; offset: number } | {
+  mode: "window";
+  frame: { preceding: number; following: number; requireFullWindow: boolean };
+} {
+  if (frame.kind === "offset") {
+    return { mode: "offset", offset: frame.offset };
+  }
+
+  if (frame.kind === "rolling") {
+    const preceding = Math.max(0, frame.count - 1);
+    return {
+      mode: "window",
+      frame: { preceding, following: 0, requireFullWindow: false },
+    };
+  }
+
+  // cumulative
+  return {
+    mode: "window",
+    frame: {
+      preceding: Number.MAX_SAFE_INTEGER,
+      following: 0,
+      requireFullWindow: false,
+    },
+  };
+}
+
+function evaluateWindowNode(
+  node: Extract<MetricExpr, { kind: "Window" }>,
+  ctx: MetricComputationContext,
+  evaluator: (node: MetricExpr, ctx: MetricComputationContext) => number | undefined
+): number | undefined {
+  const runtime = ctx.helpers.runtime;
+  const cacheBucket: Map<string, Map<string, number | undefined>> =
+    (runtime as any).__windowCache ?? new Map();
+  (runtime as any).__windowCache = cacheBucket;
+
+  const cacheKey = JSON.stringify({
+    partitionBy: node.partitionBy,
+    orderBy: node.orderBy,
+    frame: node.frame,
+    aggregate: node.aggregate,
+    base: node.base,
+    grain: runtime.groupDimensions,
+  });
+
+  if (!cacheBucket.has(cacheKey)) {
+    const normalized = normalizeWindowFrame(node.frame);
+
+    const relationGroups = runtime.relation
+      .groupBy((row: Row) => keyFromRow(row, runtime.groupDimensions), (row) => row)
+      .toArray();
+
+    const metricCache = new Map<string, number | undefined>();
+
+    const partitionKey = (groupKey: Record<string, any>) => {
+      const key: Record<string, any> = {};
+      node.partitionBy.forEach((p) => (key[p] = groupKey[p]));
+      return JSON.stringify(key);
+    };
+
+    const orderValue = (groupKey: Record<string, any>) => groupKey[node.orderBy];
+
+    const rowsWithValues = relationGroups.map((group) => {
+      const sample = group.first();
+      const groupKey: Record<string, any> = {};
+      runtime.groupDimensions.forEach((d) => (groupKey[d] = (sample as any)?.[d]));
+
+      const evalMetricForGroup = (metricName: string) =>
+        evaluateMetricRuntime(metricName, runtime, groupKey, group, undefined, metricCache);
+
+      const value = evaluator(node.base, {
+        rows: group,
+        groupKey,
+        evalMetric: evalMetricForGroup,
+        helpers: ctx.helpers,
+      });
+
+      return { groupKey, value };
+    });
+
+    const valuesByGroup = new Map<string, number | undefined>();
+
+    if (normalized.mode === "offset") {
+      const groups = Enumerable.from(rowsWithValues)
+        .groupBy((g) => partitionKey(g.groupKey))
+        .toArray();
+
+      groups.forEach((group) => {
+        const ordered = group
+          .orderBy((g) => orderValue(g.groupKey))
+          .toArray();
+
+        ordered.forEach((item, idx) => {
+          const targetIdx = idx + normalized.offset;
+          const target = ordered[targetIdx];
+          const aggregated = aggregateWindowValues(
+            target ? [target.value] : [],
+            node.aggregate
+          );
+          valuesByGroup.set(keyFromGroup(item.groupKey), aggregated);
+        });
+      });
+    } else {
+      Enumerable.from(rowsWithValues)
+        .windowBy(
+          (g) => partitionKey(g.groupKey),
+          (g) => orderValue(g.groupKey),
+          normalized.frame,
+          ({ row, window }) => {
+            const aggregated = aggregateWindowValues(
+              window.map((w) => w.value),
+              node.aggregate
+            );
+            valuesByGroup.set(keyFromGroup(row.groupKey), aggregated);
+            return aggregated;
+          }
+        )
+        .toArray();
+    }
+
+    cacheBucket.set(cacheKey, valuesByGroup);
+  }
+
+  const cachedMap = cacheBucket.get(cacheKey)!;
+  return cachedMap.get(keyFromGroup(ctx.groupKey));
+}
+
 function evalBinary(
   op: "+" | "-" | "*" | "/",
   left?: number,
@@ -882,6 +1090,26 @@ export function compileMetricExpr(expr: MetricExpr): MetricEvalV2 {
       }
     }
 
+    if (node.kind === "Window") {
+      if (!node.orderBy) {
+        throw new Error("windowBy() requires an orderBy attribute");
+      }
+      if (!node.frame) {
+        throw new Error("windowBy() requires a frame definition");
+      }
+      if (!node.aggregate) {
+        throw new Error("windowBy() requires an aggregate");
+      }
+
+      const agg = node.aggregate.toLowerCase();
+      if (!("sum|avg|min|max|count".split("|") as string[]).includes(agg)) {
+        throw new Error(`Unsupported window aggregate: ${node.aggregate}`);
+      }
+
+      validateWindowFrame(node.frame);
+      validate(node.base);
+    }
+
     if (node.kind === "BinaryOp") {
       validate(node.left);
       validate(node.right);
@@ -902,6 +1130,8 @@ export function compileMetricExpr(expr: MetricExpr): MetricEvalV2 {
         return Number(ctx.groupKey[node.name]);
       case "MetricRef":
         return ctx.evalMetric(node.name);
+      case "Window":
+        return evaluateWindowNode(node, ctx, evaluator);
       case "Transform": {
         if (node.transformKind === "table") {
           const cacheLabel = `${node.transformId}:transform`;
