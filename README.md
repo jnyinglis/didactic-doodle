@@ -34,6 +34,10 @@ This repository contains a **grain-agnostic semantic metrics engine** built enti
    ```bash
    npx ts-node src/semanticEngineDemo.ts
    ```
+4. **Explore the DSL demo** for parsing metric and query definitions from text:
+   ```bash
+   npx ts-node src/dslDemo.ts
+   ```
 
 ## Using the engine
 
