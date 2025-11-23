@@ -12,6 +12,7 @@
 //   which rows a metric sees, but still reporting at the current grain.
 
 import Enumerable from "./linq";
+import { compileDslToModel } from "./dsl";
 
 /* --------------------------------------------------------------------------
  * BASIC TYPES
@@ -349,11 +350,14 @@ export interface TableTransformDefinition {
   fallbackMappedKey?: any;
 }
 
-export interface SemanticModel {
+export interface Schema {
   facts: Record<string, FactDefinition>;
   dimensions: Record<string, DimensionDefinition>;
   attributes: Record<string, LogicalAttribute>;
   joins: JoinEdge[];
+}
+
+export interface SemanticModel extends Schema {
   metrics: MetricRegistry;
   rowsetTransforms?: Record<string, RowsetTransformDefinition>;
   tableTransforms?: Record<string, TableTransformDefinition>;
@@ -628,6 +632,58 @@ export type QuerySpecV2 = QuerySpec;
 
 export interface ExecutionOptions {
   bindings?: Record<string, any>;
+}
+
+export class SemanticEngine {
+  private schema: Schema;
+  private model: SemanticModel;
+  private queries: Record<string, QuerySpecV2> = {};
+  private db: InMemoryDb;
+
+  private constructor(schema: Schema, db: InMemoryDb) {
+    this.schema = schema;
+    this.model = { ...schema, metrics: {} };
+    this.db = db;
+  }
+
+  static fromSchema(schema: Schema, db: InMemoryDb): SemanticEngine {
+    return new SemanticEngine(schema, db);
+  }
+
+  useDslFile(text: string): this {
+    const { model, queries } = compileDslToModel(text, this.model);
+    this.model = model;
+    this.queries = { ...this.queries, ...queries };
+    return this;
+  }
+
+  registerMetric(def: MetricDefinition): this {
+    this.model.metrics[def.name] = def;
+    return this;
+  }
+
+  registerQuery(name: string, spec: QuerySpecV2): this {
+    this.queries[name] = spec;
+    return this;
+  }
+
+  getModel(): SemanticModel {
+    return this.model;
+  }
+
+  getQuery(name: string): QuerySpecV2 {
+    const q = this.queries[name];
+    if (!q) {
+      throw new Error(`Unknown query: ${name}`);
+    }
+    return q;
+  }
+
+  runQuery(nameOrSpec: string | QuerySpecV2, bindings?: FilterContext) {
+    const spec =
+      typeof nameOrSpec === "string" ? this.getQuery(nameOrSpec) : nameOrSpec;
+    return runSemanticQuery({ db: this.db, model: this.model }, spec);
+  }
 }
 
 /* --------------------------------------------------------------------------

@@ -1,55 +1,10 @@
 import {
-  MetricDeclAst,
-  metricDecl,
-  parseAll,
-  queryDecl,
-  resolveMetricRefs,
-  validateMetricExpr,
-} from "./dsl";
-import {
   InMemoryDb,
   LogicalAttribute,
-  MetricDefinition,
-  MetricRegistry,
   QuerySpec,
-  SemanticModel,
-  runSemanticQuery,
+  Schema,
+  SemanticEngine,
 } from "./semanticEngine";
-import { buildMetricFromExpr } from "./semanticEngine";
-
-function parseMetricBlock(source: string): MetricDeclAst[] {
-  const defs: MetricDeclAst[] = [];
-  let pos = 0;
-
-  while (pos < source.length) {
-    const remaining = source.slice(pos);
-    if (!remaining.trim()) break;
-
-    const next = metricDecl(source, pos);
-    if (!next) {
-      throw new Error(`Could not parse metric definition near: ${remaining.slice(0, 80)}`);
-    }
-    defs.push(next.value);
-    pos = next.nextPos;
-  }
-
-  return defs;
-}
-
-function compileMetrics(metricAsts: MetricDeclAst[]): MetricRegistry {
-  const metricNames = new Set(metricAsts.map((m) => m.name));
-  return metricAsts.reduce<MetricRegistry>((registry, ast) => {
-    const resolved = resolveMetricRefs(ast.expr, metricNames);
-    validateMetricExpr(resolved);
-    const compiled = buildMetricFromExpr({
-      name: ast.name,
-      baseFact: ast.baseFact,
-      expr: resolved,
-    }) as MetricDefinition;
-    registry[compiled.name] = compiled;
-    return registry;
-  }, {});
-}
 
 function runDslDemo() {
   const metricText = `
@@ -67,9 +22,6 @@ query weekly_sales {
   having: total_sales > 100
 }
 `;
-
-  const metricDefs = parseMetricBlock(metricText);
-  const metrics = compileMetrics(metricDefs);
 
   // Column defaults to the attribute ID; most entries rely on that shortcut here.
   const attributes: Record<string, LogicalAttribute> = {
@@ -118,14 +70,12 @@ query weekly_sales {
     },
   };
 
-  const model: SemanticModel = {
+  const schema: Schema = {
     facts: {
-      // Could also be `{}` thanks to the `table ?? id` default; kept explicit here for clarity.
       fact_orders: { table: "fact_orders" },
       fact_returns: { table: "fact_returns" },
     },
     dimensions: {
-      // Likewise, `{}` would resolve to the dimension ID if you prefer the shortcut.
       dim_store: { table: "dim_store" },
       dim_week: { table: "dim_week" },
     },
@@ -136,23 +86,21 @@ query weekly_sales {
       { fact: "fact_orders", dimension: "dim_week", factKey: "weekCode", dimensionKey: "code" },
       { fact: "fact_returns", dimension: "dim_week", factKey: "weekCode", dimensionKey: "code" },
     ],
-    metrics,
   };
 
-  const spec: QuerySpec = parseAll(queryDecl, queryText).spec;
-  const rows = runSemanticQuery({ db, model }, spec);
+  const engine = SemanticEngine.fromSchema(schema, db)
+    .useDslFile(metricText)
+    .useDslFile(queryText);
+
+  const rows = engine.runQuery("weekly_sales");
 
   const unionSpec: QuerySpec = {
     dimensions: ["storeName", "region"],
     metrics: ["total_sales", "total_refunds"],
   };
-  const unionRows = runSemanticQuery({ db, model }, unionSpec);
+  const unionRows = engine.runQuery(unionSpec);
 
-  console.log("DSL metrics parsed:");
-  metricDefs.forEach((m) => console.log(`- ${m.name} (base fact: ${m.baseFact ?? "<derived>"})`));
-  console.log("\nQuery spec:", JSON.stringify(spec, null, 2));
-  console.log("\nDSL demo output:", rows);
-  console.log("\nUnion-of-dimensions query spec:", JSON.stringify(unionSpec, null, 2));
+  console.log("DSL demo output:", rows);
   console.log("Union-of-dimensions DSL output:", unionRows);
 }
 
