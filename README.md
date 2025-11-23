@@ -39,6 +39,13 @@ This repository contains a **grain-agnostic semantic metrics engine** built enti
    npx ts-node src/dslDemo.ts
    ```
 
+5. **Launch the browser playground** to explore the engine in a React + Vite SPA:
+   ```bash
+   npm run web:dev
+   ```
+   The playground lives in `web-playground/` and reuses the in-repo semantic engine for live calculations.
+   Deployments to GitHub Pages are automated via the `Deploy web playground to GitHub Pages` workflow; pushing to `main` builds `web-playground/dist` and publishes it to the repository's Pages site.
+
 ## Using the engine
 
 Relational queries are described with `QuerySpec` objects that list the output dimensions, metrics, and filters. Metrics are plain functions declared via helpers such as `aggregateMetric` and are free to call other metrics through `evalMetric` or swap rowsets through `applyRowsetTransform`.
