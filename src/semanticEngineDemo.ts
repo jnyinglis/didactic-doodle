@@ -1,14 +1,13 @@
 import {
   Expr,
-  MetricRegistry,
   aggregateMetric,
   buildMetricFromExpr,
   f,
   InMemoryDb,
   LogicalAttribute,
   QuerySpec,
-  SemanticModel,
-  runSemanticQuery,
+  Schema,
+  SemanticEngine,
 } from "./semanticEngine";
 
 function runSemanticEngineDemo() {
@@ -58,18 +57,7 @@ function runSemanticEngineDemo() {
     },
   };
 
-  const metrics: MetricRegistry = {
-    total_sales: aggregateMetric("total_sales", "fact_orders", "amount", "sum"),
-    total_refunds: aggregateMetric("total_refunds", "fact_returns", "refund", "sum"),
-    avg_ticket: buildMetricFromExpr({
-      name: "avg_ticket",
-      baseFact: "fact_orders",
-      expr: Expr.div(Expr.metric("total_sales"), Expr.count("orderId")),
-    }),
-    orders: aggregateMetric("orders", "fact_orders", "orderId", "count"),
-  };
-
-  const model: SemanticModel = {
+  const schema: Schema = {
     facts: {
       fact_orders: { table: "fact_orders" },
       fact_returns: { table: "fact_returns" },
@@ -85,8 +73,19 @@ function runSemanticEngineDemo() {
       { fact: "fact_orders", dimension: "dim_week", factKey: "weekCode", dimensionKey: "code" },
       { fact: "fact_returns", dimension: "dim_week", factKey: "weekCode", dimensionKey: "code" },
     ],
-    metrics,
   };
+
+  const engine = SemanticEngine.fromSchema(schema, db)
+    .registerMetric(aggregateMetric("total_sales", "fact_orders", "amount", "sum"))
+    .registerMetric(aggregateMetric("total_refunds", "fact_returns", "refund", "sum"))
+    .registerMetric(
+      buildMetricFromExpr({
+        name: "avg_ticket",
+        baseFact: "fact_orders",
+        expr: Expr.div(Expr.metric("total_sales"), Expr.count("orderId")),
+      })
+    )
+    .registerMetric(aggregateMetric("orders", "fact_orders", "orderId", "count"));
 
   const spec: QuerySpec = {
     dimensions: ["storeName", "region", "salesWeek"],
@@ -95,14 +94,16 @@ function runSemanticEngineDemo() {
     having: (values) => (values.total_sales ?? 0) > 100,
   };
 
-  const rows = runSemanticQuery({ db, model }, spec);
+  engine.registerQuery("weekly_sales", spec);
+
+  const rows = engine.runQuery("weekly_sales");
 
   const unionSpec: QuerySpec = {
     dimensions: ["storeName", "region"],
     metrics: ["total_sales", "total_refunds"],
   };
 
-  const unionRows = runSemanticQuery({ db, model }, unionSpec);
+  const unionRows = engine.runQuery(unionSpec);
 
   console.log("Semantic engine query spec:", JSON.stringify(spec, null, 2));
   console.log("Semantic engine demo output:", rows);
