@@ -5,7 +5,10 @@
   "main": "index.js",
   "scripts": {
     "test": "mocha -r ts-node/register 'test/**/*.test.ts'",
-    "dsl-demo": "ts-node src/dslDemo.ts"
+    "dsl-demo": "ts-node src/dslDemo.ts",
+    "web:dev": "npx vite --config web-playground/vite.config.ts",
+    "web:build": "npx vite build --config web-playground/vite.config.ts",
+    "web:preview": "npx vite preview --config web-playground/vite.config.ts"
   },
   "keywords": [],
   "author": "",
@@ -14,9 +17,17 @@
   "devDependencies": {
     "@types/chai": "^5.2.3",
     "@types/mocha": "^10.0.10",
+    "@types/react": "^18.3.11",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.2",
     "chai": "^6.2.1",
     "mocha": "^11.7.5",
     "ts-node": "^10.9.2",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vite": "^5.4.8"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
   }
 }
