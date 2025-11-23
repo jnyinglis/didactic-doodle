@@ -479,10 +479,15 @@ export function parseDsl(text: string): DslFileAst {
   return result.value;
 }
 
+export interface DslCompileResult {
+  model: SemanticModel;
+  queries: Record<string, QuerySpecV2>;
+}
+
 export function compileDslToModel(
   text: string,
   baseModel: SemanticModel
-): { model: SemanticModel; queries: Record<string, QuerySpecV2> } {
+): DslCompileResult {
   const ast = parseDsl(text);
   const metricNames = new Set([
     ...Object.keys(baseModel.metrics ?? {}),
